@@ -1,0 +1,3 @@
+bench.json
+*.out
+*.prof
