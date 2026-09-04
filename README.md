@@ -1,9 +1,18 @@
 # matchbook
 
-A price-time priority limit order book and matching engine in Go. Single
-instrument, single goroutine, zero locks — determinism is the point: the same
-order stream always produces the same trade stream, which is what makes an
-exchange core testable at all.
+A stock exchange has a program at its center that pairs people who want to buy
+with people who want to sell. It is called a matching engine, and it has to be
+both extremely fast and completely predictable: the same stream of orders must
+always produce the exact same trades, or the exchange cannot be trusted or
+tested.
+
+matchbook is my version of that core, written in Go. It handles one instrument
+on one thread with no locks, which is what makes it predictable. Orders are
+matched by price first and then by who got there first, big orders can fill
+partially, cancelling is instant, and it can report how much buying and selling
+interest sits at each price. It processes about 2 million orders per second
+with a typical latency of a third of a microsecond, and it is tested by
+throwing random order streams at it and checking the rules always hold.
 
 ## Features
 
