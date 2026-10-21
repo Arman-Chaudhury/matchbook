@@ -50,3 +50,47 @@ type Trade struct {
 	Price   int64
 	Qty     int64
 }
+
+// Status reports what Process did with an order.
+type Status int8
+
+const (
+	Rejected  Status = iota // invalid input; the book is unchanged
+	Filled                  // fully filled; nothing rests
+	Rested                  // limit order: the unfilled remainder rests on the book
+	Discarded               // market order: the unfilled remainder was dropped (IOC)
+)
+
+func (s Status) String() string {
+	switch s {
+	case Rejected:
+		return "rejected"
+	case Filled:
+		return "filled"
+	case Rested:
+		return "rested"
+	}
+	return "discarded"
+}
+
+// Reject explains a Rejected result.
+type Reject int8
+
+const (
+	RejectNone        Reject = iota
+	RejectQty                // Qty <= 0
+	RejectPrice              // limit order with Price <= 0
+	RejectDuplicateID        // an order with this ID is already resting
+)
+
+// Result is the outcome of one call to Process.
+//
+// Trades is only valid until the next call to Process. Remaining is the
+// quantity left after matching: resting on the book for Rested, discarded
+// for Discarded, zero otherwise.
+type Result struct {
+	Status    Status
+	Reject    Reject
+	Trades    []Trade
+	Remaining int64
+}

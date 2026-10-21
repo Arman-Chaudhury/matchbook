@@ -18,7 +18,10 @@ throwing random order streams at it and checking the rules always hold.
 
 - **Limit and market orders** with price-time (FIFO) priority and partial fills
 - **Price improvement to the taker** — fills always execute at the maker's price
-- **O(1) cancels** via tombstoning with lazy cleanup at the queue head
+- **O(1) cancels** via tombstoning with lazy cleanup at the queue head;
+  busy levels compact their queue so dead orders never pile up
+- **Explicit outcomes**: every order comes back as rested, filled, discarded,
+  or rejected with a reason (bad quantity, bad price, duplicate ID)
 - **Aggregated depth snapshots** (top-N levels per side)
 - **Allocation-conscious hot path** — the trade buffer is reused across calls;
   integer tick prices keep floats out of the matching path entirely
@@ -72,13 +75,21 @@ Reproduce with a fixed seed: the flow generator is deterministic (`-seed`).
 
 - **Property-based suite**: 300 random scenarios × 400 operations, each
   cross-checked operation-by-operation against a naive O(n) reference
-  implementation — trades, cancels, top-of-book, and final depth must be
-  identical. The book-never-crossed invariant is asserted after every op.
+  implementation — status, trades, cancels, top-of-book, and final depth
+  must be identical. The stream includes duplicate IDs and invalid prices.
+  The book-never-crossed invariant is asserted after every op.
+- **Fuzzing**: `go test -fuzz=FuzzEngineVsReference` decodes arbitrary bytes
+  into order streams and checks the engine against the reference model, so
+  the fuzzer can search for sequences the random suite never generates.
+- **Golden determinism test**: a fixed 50,000-operation stream must hash to
+  the same value on every run and every machine. If behaviour changes, this
+  test says so.
 - **Conservation property**: every unit of submitted quantity is provably
   filled, resting, cancelled, or discarded (market IOC remainder).
 - Table-driven unit tests for FIFO priority, price priority, partial fills,
-  price improvement, IOC semantics, cancels, and input validation.
-- `go test -race -cover ./...` → **96.8% statement coverage**, race-clean.
+  price improvement, IOC semantics, cancels, duplicate-ID rejection, input
+  validation, and level compaction.
+- `go test -race -cover ./...` → **99.3% statement coverage**, race-clean.
 
 ## Usage
 
@@ -86,8 +97,12 @@ Reproduce with a fixed seed: the flow generator is deterministic (`-seed`).
 eng := matchbook.NewEngine()
 
 eng.Process(matchbook.Order{ID: 1, Side: matchbook.Sell, Type: matchbook.Limit, Price: 100, Qty: 10})
-trades := eng.Process(matchbook.Order{ID: 2, Side: matchbook.Buy, Type: matchbook.Limit, Price: 102, Qty: 4})
-// trades: [{TakerID:2 MakerID:1 Price:100 Qty:4}] — taker gets price improvement
+res := eng.Process(matchbook.Order{ID: 2, Side: matchbook.Buy, Type: matchbook.Limit, Price: 102, Qty: 4})
+// res.Status: Filled
+// res.Trades: [{TakerID:2 MakerID:1 Price:100 Qty:4}] — taker gets price improvement
+
+dup := eng.Process(matchbook.Order{ID: 1, Side: matchbook.Sell, Type: matchbook.Limit, Price: 101, Qty: 1})
+// dup.Status: Rejected, dup.Reject: RejectDuplicateID — the book is untouched
 
 bid, qty, ok := eng.BestBid()
 depth := eng.Depth(matchbook.Sell, 5)

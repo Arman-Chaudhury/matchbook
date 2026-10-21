@@ -66,7 +66,7 @@ func main() {
 	start := time.Now()
 	for i, o := range orders {
 		t0 := time.Now()
-		trades += len(eng.Process(o))
+		trades += len(eng.Process(o).Trades)
 		lat[i] = int64(time.Since(t0))
 	}
 	elapsed := time.Since(start)

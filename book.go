@@ -6,6 +6,7 @@ import "container/heap"
 // and skipped lazily when their level reaches the front of the queue.
 type resting struct {
 	id        int64
+	side      Side
 	price     int64
 	qty       int64
 	seq       uint64 // arrival sequence: FIFO within a price level
@@ -26,16 +27,37 @@ func (l *level) push(r *resting) {
 	l.qty += r.qty
 }
 
+// compactAt is the number of consumed slots a level tolerates before its
+// queue is compacted. Without compaction a busy price level keeps every
+// dead order it ever held until the level itself empties, which at an
+// active price may never happen.
+const compactAt = 64
+
 // front returns the first live order at this level, skipping tombstones.
 func (l *level) front() *resting {
 	for l.head < len(l.orders) {
 		r := l.orders[l.head]
 		if !r.cancelled && r.qty > 0 {
-			return r
+			break
 		}
 		l.head++
 	}
+	if l.head >= compactAt && l.head*2 >= len(l.orders) {
+		l.compact()
+	}
+	if l.head < len(l.orders) {
+		return l.orders[l.head]
+	}
 	return nil
+}
+
+// compact drops the consumed prefix of the queue and releases the pointers
+// it held so the resting orders can be garbage collected.
+func (l *level) compact() {
+	n := copy(l.orders, l.orders[l.head:])
+	clear(l.orders[n:])
+	l.orders = l.orders[:n]
+	l.head = 0
 }
 
 func (l *level) empty() bool { return l.front() == nil }

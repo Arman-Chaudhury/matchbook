@@ -47,9 +47,14 @@ func (rb *refBook) bestMaker(taker Side) *refOrder {
 	return best
 }
 
-func (rb *refBook) process(o Order) []Trade {
-	if o.Qty <= 0 || (o.Type == Limit && o.Price <= 0) {
-		return nil
+func (rb *refBook) process(o Order) Result {
+	if r := validate(o); r != RejectNone {
+		return Result{Status: Rejected, Reject: r}
+	}
+	for _, r := range rb.orders {
+		if r.id == o.ID && r.qty > 0 {
+			return Result{Status: Rejected, Reject: RejectDuplicateID}
+		}
 	}
 	var trades []Trade
 	for o.Qty > 0 {
@@ -62,13 +67,19 @@ func (rb *refBook) process(o Order) []Trade {
 		o.Qty -= qty
 		m.qty -= qty
 	}
-	if o.Qty > 0 && o.Type == Limit {
+	res := Result{Status: Filled, Trades: trades, Remaining: o.Qty}
+	switch {
+	case o.Qty == 0:
+	case o.Type == Market:
+		res.Status = Discarded
+	default:
+		res.Status = Rested
 		rb.seq++
 		rb.orders = append(rb.orders, &refOrder{
 			id: o.ID, side: o.Side, price: o.Price, qty: o.Qty, seq: rb.seq,
 		})
 	}
-	return trades
+	return res
 }
 
 func (rb *refBook) cancel(id int64) bool {
@@ -135,25 +146,33 @@ func TestPropertyEngineMatchesReferenceModel(t *testing.T) {
 						t.Fatalf("op %d: cancel(%d) = %v, ref %v", op, id, got, want)
 					}
 				default:
-					nextID++
 					o := Order{
-						ID:   nextID,
 						Side: Side(rng.Intn(2)),
 						Type: Limit,
 						Qty:  int64(1 + rng.Intn(50)),
 					}
-					if rng.Intn(8) == 0 {
-						o.Type = Market
+					if rng.Intn(25) == 0 && len(live) > 0 { // resubmit a known id
+						o.ID = live[rng.Intn(len(live))]
 					} else {
-						o.Price = int64(priceFloor + rng.Intn(priceBand))
-						live = append(live, o.ID)
+						nextID++
+						o.ID = nextID
 					}
-					got := append([]Trade(nil), eng.Process(o)...)
+					switch {
+					case rng.Intn(8) == 0:
+						o.Type = Market
+					case rng.Intn(40) == 0:
+						o.Price = int64(-rng.Intn(2)) // invalid price
+					default:
+						o.Price = int64(priceFloor + rng.Intn(priceBand))
+					}
+					got := eng.Process(o)
+					got.Trades = append([]Trade(nil), got.Trades...)
 					want := ref.process(o)
-					if len(got) != 0 || len(want) != 0 {
-						if !reflect.DeepEqual(got, want) {
-							t.Fatalf("op %d: order %+v\nengine: %v\nref:    %v", op, o, got, want)
-						}
+					if !sameResult(got, want) {
+						t.Fatalf("op %d: order %+v\nengine: %+v\nref:    %+v", op, o, got, want)
+					}
+					if got.Status == Rested {
+						live = append(live, o.ID)
 					}
 				}
 
@@ -177,6 +196,18 @@ func TestPropertyEngineMatchesReferenceModel(t *testing.T) {
 			}
 		})
 	}
+}
+
+// sameResult compares two results, treating nil and empty trade slices
+// as equal.
+func sameResult(a, b Result) bool {
+	if a.Status != b.Status || a.Reject != b.Reject || a.Remaining != b.Remaining {
+		return false
+	}
+	if len(a.Trades) == 0 && len(b.Trades) == 0 {
+		return true
+	}
+	return reflect.DeepEqual(a.Trades, b.Trades)
 }
 
 // TestPropertyConservation checks that every unit of submitted quantity is
@@ -204,7 +235,7 @@ func TestPropertyConservation(t *testing.T) {
 			}
 			submitted += o.Qty
 			remaining[o.ID] = &rec{qty: o.Qty, market: o.Type == Market}
-			for _, tr := range eng.Process(o) {
+			for _, tr := range eng.Process(o).Trades {
 				filled += 2 * tr.Qty
 				remaining[tr.TakerID].qty -= tr.Qty
 				remaining[tr.MakerID].qty -= tr.Qty

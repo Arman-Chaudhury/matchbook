@@ -32,14 +32,18 @@ func crosses(side Side, typ Type, takerPrice, makerPrice int64) bool {
 	return takerPrice <= makerPrice
 }
 
-// Process matches an incoming order against the book, returning the fills
-// it generated. Unfilled limit quantity rests on the book; unfilled market
-// quantity is discarded (immediate-or-cancel semantics).
+// Process matches an incoming order against the book and reports what
+// happened. Unfilled limit quantity rests on the book; unfilled market
+// quantity is discarded (immediate-or-cancel semantics). An order whose ID
+// is already resting is rejected and the book is left untouched.
 //
-// The returned slice is only valid until the next call to Process.
-func (e *Engine) Process(o Order) []Trade {
-	if o.Qty <= 0 || (o.Type == Limit && o.Price <= 0) {
-		return nil
+// Result.Trades is only valid until the next call to Process.
+func (e *Engine) Process(o Order) Result {
+	if r := validate(o); r != RejectNone {
+		return Result{Status: Rejected, Reject: r}
+	}
+	if _, dup := e.byID[o.ID]; dup {
+		return Result{Status: Rejected, Reject: RejectDuplicateID}
 	}
 	e.trade = e.trade[:0]
 
@@ -67,9 +71,15 @@ func (e *Engine) Process(o Order) []Trade {
 		}
 	}
 
-	if o.Qty > 0 && o.Type == Limit {
+	res := Result{Status: Filled, Trades: e.trade, Remaining: o.Qty}
+	switch {
+	case o.Qty == 0:
+	case o.Type == Market:
+		res.Status = Discarded
+	default:
+		res.Status = Rested
 		e.seq++
-		r := &resting{id: o.ID, price: o.Price, qty: o.Qty, seq: e.seq}
+		r := &resting{id: o.ID, side: o.Side, price: o.Price, qty: o.Qty, seq: e.seq}
 		e.byID[o.ID] = r
 		if o.Side == Buy {
 			e.bids.add(r)
@@ -77,7 +87,18 @@ func (e *Engine) Process(o Order) []Trade {
 			e.asks.add(r)
 		}
 	}
-	return e.trade
+	return res
+}
+
+// validate checks an order's fields without consulting the book.
+func validate(o Order) Reject {
+	switch {
+	case o.Qty <= 0:
+		return RejectQty
+	case o.Type == Limit && o.Price <= 0:
+		return RejectPrice
+	}
+	return RejectNone
 }
 
 // Cancel removes a resting order by ID. Returns false if unknown (already
@@ -90,11 +111,11 @@ func (e *Engine) Cancel(id int64) bool {
 	r.cancelled = true
 	delete(e.byID, id)
 	// Adjust the level's live quantity so depth snapshots stay accurate.
-	for _, sb := range [2]*sideBook{e.bids, e.asks} {
-		if lv, ok := sb.levels[r.price]; ok {
-			lv.qty -= r.qty
-		}
+	sb := e.bids
+	if r.side == Sell {
+		sb = e.asks
 	}
+	sb.levels[r.price].qty -= r.qty
 	r.qty = 0
 	return true
 }
