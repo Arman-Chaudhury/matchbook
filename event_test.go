@@ -146,33 +146,34 @@ func TestApplyMatchesDirectCalls(t *testing.T) {
 	}
 }
 
-// randomCommands generates a seeded command stream with the same shape as
-// the property suite: mostly limits in a tight band, some markets, some
-// cancels, a few duplicate IDs and bad prices.
+// randomCommands generates a seeded command stream with the same feature
+// mix as the property suite (randomOrder), plus cancels and replaces of
+// known IDs and a few duplicate IDs.
 func randomCommands(seed int64, n int) []Command {
 	rng := rand.New(rand.NewSource(seed))
 	cmds := make([]Command, 0, n)
 	var nextID int64
 	var live []int64
 	for i := 0; i < n; i++ {
-		if rng.Intn(10) == 0 && len(live) > 0 {
+		switch r := rng.Intn(100); {
+		case r < 10 && len(live) > 0:
 			cmds = append(cmds, Command{Kind: CmdCancel, Order: Order{ID: live[rng.Intn(len(live))]}})
 			continue
+		case r < 18 && len(live) > 0:
+			cmds = append(cmds, Command{Kind: CmdReplace, Order: Order{
+				ID: live[rng.Intn(len(live))], Price: int64(priceFloor + rng.Intn(priceBand)), Qty: int64(1 + rng.Intn(50)),
+			}})
+			continue
 		}
-		o := Order{Side: Side(rng.Intn(2)), Type: Limit, Qty: int64(1 + rng.Intn(50))}
+		var id int64
 		if rng.Intn(25) == 0 && len(live) > 0 {
-			o.ID = live[rng.Intn(len(live))]
+			id = live[rng.Intn(len(live))]
 		} else {
 			nextID++
-			o.ID = nextID
+			id = nextID
 		}
-		switch {
-		case rng.Intn(8) == 0:
-			o.Type = Market
-		case rng.Intn(40) == 0:
-			o.Price = 0
-		default:
-			o.Price = int64(priceFloor + rng.Intn(priceBand))
+		o := randomOrder(rng, id)
+		if o.Type == Limit && o.TIF == GTC && o.Price > 0 {
 			live = append(live, o.ID)
 		}
 		cmds = append(cmds, Command{Kind: CmdSubmit, Order: o})
@@ -180,15 +181,44 @@ func randomCommands(seed int64, n int) []Command {
 	return cmds
 }
 
+func TestJournalEncodesEveryField(t *testing.T) {
+	cmds := []Command{
+		{Kind: CmdSubmit, Order: Order{ID: -5, Owner: 1 << 40, Side: Sell, Type: Limit, TIF: FOK, PostOnly: true, Price: 123456789, Qty: 7}},
+		{Kind: CmdSubmit, Order: Order{ID: 2, Side: Buy, Type: Market, TIF: IOC, Qty: 1}},
+		{Kind: CmdCancel, Order: Order{ID: 9}},
+		{Kind: CmdReplace, Order: Order{ID: 9, Price: 100, Qty: 3}},
+	}
+	for _, c := range cmds {
+		var b [recordSize]byte
+		encodeCommand(&b, c)
+		got, err := decodeCommand(&b)
+		if err != nil || !reflect.DeepEqual(got, c) {
+			t.Fatalf("round trip %+v -> %+v err=%v", c, got, err)
+		}
+	}
+	var b [recordSize]byte
+	encodeCommand(&b, cmds[0])
+	b[4] = 2 // post-only flag out of range
+	if _, err := decodeCommand(&b); err == nil {
+		t.Fatal("bad flag should be rejected")
+	}
+	encodeCommand(&b, cmds[0])
+	b[0] = byte(CmdReplace) + 1
+	if _, err := decodeCommand(&b); err == nil {
+		t.Fatal("bad kind should be rejected")
+	}
+}
+
 func TestJournalReplayReproducesDigest(t *testing.T) {
 	for seed := int64(0); seed < 20; seed++ {
 		cmds := randomCommands(seed, 2000)
+		stp := STPMode(seed % 3)
 		var buf bytes.Buffer
 		j, err := NewJournal(&buf)
 		if err != nil {
 			t.Fatal(err)
 		}
-		live := NewEngine()
+		live := NewEngine(WithSelfTradePrevention(stp))
 		var allEvents []Event
 		for _, c := range cmds {
 			if err := j.Append(c); err != nil {
@@ -200,7 +230,7 @@ func TestJournalReplayReproducesDigest(t *testing.T) {
 			t.Fatalf("journal size %d, want %d", got, len(journalMagic)+recordSize*len(cmds))
 		}
 
-		replayed := NewEngine()
+		replayed := NewEngine(WithSelfTradePrevention(stp))
 		n, err := Replay(bytes.NewReader(buf.Bytes()), replayed)
 		if err != nil || n != len(cmds) {
 			t.Fatalf("seed %d: replay n=%d err=%v", seed, n, err)
@@ -321,7 +351,7 @@ func TestPropertySnapshotAtAnyPoint(t *testing.T) {
 		cmds := randomCommands(100+seed, 1500)
 		cut := rand.New(rand.NewSource(seed)).Intn(len(cmds))
 
-		live := NewEngine()
+		live := NewEngine(WithSelfTradePrevention(STPMode(seed % 3)))
 		for _, c := range cmds[:cut] {
 			live.Apply(c)
 		}
@@ -332,6 +362,9 @@ func TestPropertySnapshotAtAnyPoint(t *testing.T) {
 		restored, err := Restore(bytes.NewReader(buf.Bytes()))
 		if err != nil {
 			t.Fatalf("seed %d cut %d: %v", seed, cut, err)
+		}
+		if restored.SelfTradePrevention() != live.SelfTradePrevention() {
+			t.Fatalf("seed %d: STP policy not restored", seed)
 		}
 		for i, c := range cmds[cut:] {
 			a := append([]Event(nil), live.Apply(c)...)
@@ -347,7 +380,7 @@ func TestPropertySnapshotAtAnyPoint(t *testing.T) {
 }
 
 func TestEventKindStrings(t *testing.T) {
-	kinds := []EventKind{EvAccepted, EvRejected, EvFill, EvRested, EvDiscarded, EvCancelled, EvCancelRejected}
+	kinds := []EventKind{EvAccepted, EvRejected, EvFill, EvRested, EvDiscarded, EvCancelled, EvCancelRejected, EvReduced}
 	seen := map[string]bool{}
 	for _, k := range kinds {
 		s := k.String()

@@ -31,14 +31,50 @@ const (
 	Market
 )
 
+// TimeInForce says how long the unfilled part of a limit order may live.
+// Market orders are always immediate-or-cancel and ignore this field.
+type TimeInForce int8
+
+const (
+	GTC TimeInForce = iota // good till cancelled: the remainder rests
+	IOC                    // immediate or cancel: the remainder is discarded
+	FOK                    // fill or kill: fills completely or not at all
+)
+
+func (t TimeInForce) String() string {
+	switch t {
+	case GTC:
+		return "GTC"
+	case IOC:
+		return "IOC"
+	}
+	return "FOK"
+}
+
+// STPMode is the engine's self-trade prevention policy, applied when an
+// incoming order would trade against a resting order with the same
+// non-zero Owner.
+type STPMode int8
+
+const (
+	STPNone        STPMode = iota // owners may trade with themselves
+	STPCancelTaker                // the incoming order's remainder is discarded
+	STPCancelMaker                // the resting order is cancelled; matching continues
+)
+
 // Order is a request to trade. Prices are integer ticks to avoid float
-// rounding in the matching path; Qty is in integer lots.
+// rounding in the matching path; Qty is in integer lots. Owner identifies
+// the participant for self-trade prevention; zero means anonymous and is
+// never prevented.
 type Order struct {
-	ID    int64
-	Side  Side
-	Type  Type
-	Price int64
-	Qty   int64
+	ID       int64
+	Owner    int64
+	Side     Side
+	Type     Type
+	TIF      TimeInForce
+	PostOnly bool
+	Price    int64
+	Qty      int64
 }
 
 // Trade is a single fill between a taker (incoming order) and a maker
@@ -81,6 +117,11 @@ const (
 	RejectQty                // Qty <= 0
 	RejectPrice              // limit order with Price <= 0
 	RejectDuplicateID        // an order with this ID is already resting
+	RejectUnknownID          // Replace named an ID that is not resting
+	RejectWouldCross         // a post-only order would have traded
+	RejectTIF                // TIF out of range
+	RejectSelfTrade          // reason on EvDiscarded/EvCancelled: self-trade prevention
+	RejectReplaced           // reason on EvCancelled: the order was replaced and re-entered
 )
 
 // Result is the outcome of one call to Process.

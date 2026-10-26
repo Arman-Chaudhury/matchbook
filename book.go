@@ -6,6 +6,7 @@ import "container/heap"
 // and skipped lazily when their level reaches the front of the queue.
 type resting struct {
 	id        int64
+	owner     int64
 	side      Side
 	price     int64
 	qty       int64

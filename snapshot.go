@@ -9,19 +9,20 @@ import (
 )
 
 // A snapshot is the engine's complete state at an instant: every resting
-// order with its arrival sequence, plus the counters and digest. Restoring
-// a snapshot and then replaying the journal records written after it
-// produces an engine indistinguishable from one that never stopped, which
-// is how an exchange recovers without replaying its whole history.
+// order with its arrival sequence, plus the counters, digest and STP
+// policy. Restoring a snapshot and then replaying the journal records
+// written after it produces an engine indistinguishable from one that never
+// stopped, which is how an exchange recovers without replaying its whole
+// history.
 //
 // Layout, little-endian: 4-byte magic, evSeq(8), seq(8), digest(8),
-// count(8), then count records of snapRecordSize bytes:
+// count(8), stp(1), pad(7), then count records of snapRecordSize bytes:
 //
-//	id(8) side(1) pad(7) price(8) qty(8) seq(8)
+//	id(8) side(1) pad(7) price(8) qty(8) seq(8) owner(8)
 const (
-	snapshotMagic  = "MBS1"
-	snapHeaderSize = 4 + 8*4
-	snapRecordSize = 40
+	snapshotMagic  = "MBS2"
+	snapHeaderSize = 4 + 8*4 + 8
+	snapRecordSize = 48
 )
 
 // ErrBadSnapshot means r did not hold a well-formed matchbook snapshot.
@@ -42,6 +43,7 @@ func (e *Engine) Snapshot(w io.Writer) error {
 	binary.LittleEndian.PutUint64(buf[12:], e.seq)
 	binary.LittleEndian.PutUint64(buf[20:], e.digest)
 	binary.LittleEndian.PutUint64(buf[28:], uint64(len(live)))
+	buf[36] = byte(e.stp)
 	off := snapHeaderSize
 	for _, r := range live {
 		binary.LittleEndian.PutUint64(buf[off:], uint64(r.id))
@@ -49,22 +51,24 @@ func (e *Engine) Snapshot(w io.Writer) error {
 		binary.LittleEndian.PutUint64(buf[off+16:], uint64(r.price))
 		binary.LittleEndian.PutUint64(buf[off+24:], uint64(r.qty))
 		binary.LittleEndian.PutUint64(buf[off+32:], r.seq)
+		binary.LittleEndian.PutUint64(buf[off+40:], uint64(r.owner))
 		off += snapRecordSize
 	}
 	_, err := w.Write(buf)
 	return err
 }
 
-// Restore builds an engine from a snapshot written by Snapshot.
+// Restore builds an engine from a snapshot written by Snapshot. The STP
+// policy is part of the snapshot, so no options are needed.
 func Restore(r io.Reader) (*Engine, error) {
 	var hdr [snapHeaderSize]byte
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
 		return nil, fmt.Errorf("%w: header: %v", ErrBadSnapshot, err)
 	}
-	if string(hdr[:4]) != snapshotMagic {
+	if string(hdr[:4]) != snapshotMagic || hdr[36] > byte(STPCancelMaker) {
 		return nil, ErrBadSnapshot
 	}
-	e := NewEngine()
+	e := NewEngine(WithSelfTradePrevention(STPMode(hdr[36])))
 	e.evSeq = binary.LittleEndian.Uint64(hdr[4:])
 	e.seq = binary.LittleEndian.Uint64(hdr[12:])
 	e.digest = binary.LittleEndian.Uint64(hdr[20:])
@@ -82,6 +86,7 @@ func Restore(r io.Reader) (*Engine, error) {
 			price: int64(binary.LittleEndian.Uint64(rec[16:])),
 			qty:   int64(binary.LittleEndian.Uint64(rec[24:])),
 			seq:   binary.LittleEndian.Uint64(rec[32:]),
+			owner: int64(binary.LittleEndian.Uint64(rec[40:])),
 		}
 		switch {
 		case o.side > Sell, o.price <= 0, o.qty <= 0,

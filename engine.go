@@ -5,45 +5,67 @@ package matchbook
 // makes an exchange core testable, and a single goroutine owning the book
 // avoids locks entirely (shard by instrument to scale out).
 type Engine struct {
-	bids   *sideBook
-	asks   *sideBook
-	byID   map[int64]*resting
-	seq    uint64
-	trade  []Trade // reused buffer to keep the hot path allocation-free
-	events []Event // reused buffer: events emitted by the last command
-	evSeq  uint64  // sequence number of the last event emitted
-	digest uint64  // FNV-1a over every event ever emitted
+	bids    *sideBook
+	asks    *sideBook
+	byID    map[int64]*resting
+	seq     uint64
+	stp     STPMode
+	trade   []Trade // reused buffer to keep the hot path allocation-free
+	events  []Event // reused buffer: events emitted by the last command
+	evSeq   uint64  // sequence number of the last event emitted
+	digest  uint64  // running hash over every event ever emitted
+	scratch []int64 // reused heap copy for read-only walks (FOK check)
 }
 
-func NewEngine() *Engine {
-	return &Engine{
+// Option configures an Engine at construction.
+type Option func(*Engine)
+
+// WithSelfTradePrevention sets what happens when an incoming order would
+// trade against a resting order with the same non-zero Owner.
+func WithSelfTradePrevention(m STPMode) Option {
+	return func(e *Engine) { e.stp = m }
+}
+
+func NewEngine(opts ...Option) *Engine {
+	e := &Engine{
 		bids:   newSideBook(true),
 		asks:   newSideBook(false),
 		byID:   make(map[int64]*resting),
 		digest: fnv64Offset,
 	}
+	for _, o := range opts {
+		o(e)
+	}
+	return e
 }
+
+// SelfTradePrevention reports the engine's configured STP policy.
+func (e *Engine) SelfTradePrevention() STPMode { return e.stp }
 
 // Apply runs one command and returns the events it produced. It is the
 // single entry point a journal replays through, and it is exactly
-// equivalent to calling Process or Cancel.
+// equivalent to calling Process, Cancel or Replace.
 func (e *Engine) Apply(c Command) []Event {
-	if c.Kind == CmdCancel {
+	switch c.Kind {
+	case CmdCancel:
 		e.Cancel(c.Order.ID)
-	} else {
+	case CmdReplace:
+		e.Replace(c.Order.ID, c.Order.Price, c.Order.Qty)
+	default:
 		e.Process(c.Order)
 	}
 	return e.events
 }
 
-// Events returns the events emitted by the most recent Process, Cancel or
-// Apply call, in order. The slice is only valid until the next call.
+// Events returns the events emitted by the most recent Process, Cancel,
+// Replace or Apply call, in order. The slice is only valid until the next
+// call.
 func (e *Engine) Events() []Event { return e.events }
 
-// Digest is a running FNV-1a hash of every event the engine has emitted.
-// Two engines that have consumed the same command stream have the same
-// digest; replaying a journal and comparing digests proves the replay
-// reproduced every output exactly.
+// Digest is a running hash of every event the engine has emitted. Two
+// engines that have consumed the same command stream have the same digest;
+// replaying a journal and comparing digests proves the replay reproduced
+// every output exactly.
 func (e *Engine) Digest() uint64 { return e.digest }
 
 // EventSeq is the sequence number of the last event emitted.
@@ -69,35 +91,69 @@ func crosses(side Side, typ Type, takerPrice, makerPrice int64) bool {
 }
 
 // Process matches an incoming order against the book and reports what
-// happened. Unfilled limit quantity rests on the book; unfilled market
-// quantity is discarded (immediate-or-cancel semantics). An order whose ID
-// is already resting is rejected and the book is left untouched.
+// happened. The rules, in the order they are applied:
 //
-// Result.Trades is only valid until the next call to Process.
+//   - Invalid fields, or an ID that is already resting, are rejected and
+//     the book is untouched.
+//   - A post-only order that would trade is rejected with RejectWouldCross.
+//   - A fill-or-kill order that cannot be filled completely is accepted and
+//     then discarded whole; nothing trades.
+//   - Matching proceeds best price first, FIFO within a price, at the
+//     maker's price. If the taker and maker share a non-zero Owner, the
+//     engine's STP policy decides: cancel the incoming remainder, or cancel
+//     the resting order and keep matching.
+//   - Whatever is left rests if the order is a GTC limit, and is discarded
+//     for market, IOC and FOK orders.
+//
+// Result.Trades is only valid until the next call.
 func (e *Engine) Process(o Order) Result {
 	e.events = e.events[:0]
 	e.trade = e.trade[:0]
+	return e.process(o)
+}
+
+// process is Process without resetting the output buffers, so Replace can
+// prepend its own events.
+func (e *Engine) process(o Order) Result {
 	if r := validate(o); r != RejectNone {
-		e.emit(Event{Kind: EvRejected, OrderID: o.ID, Reject: r})
-		return Result{Status: Rejected, Reject: r}
+		return e.reject(o.ID, r)
 	}
 	if _, dup := e.byID[o.ID]; dup {
-		e.emit(Event{Kind: EvRejected, OrderID: o.ID, Reject: RejectDuplicateID})
-		return Result{Status: Rejected, Reject: RejectDuplicateID}
+		return e.reject(o.ID, RejectDuplicateID)
 	}
-	e.emit(Event{Kind: EvAccepted, OrderID: o.ID, Side: o.Side, Type: o.Type, Price: o.Price, Qty: o.Qty})
-
 	opposite := e.asks
 	if o.Side == Sell {
 		opposite = e.bids
 	}
+	if o.PostOnly {
+		if lv := opposite.best(); lv != nil && crosses(o.Side, o.Type, o.Price, lv.price) {
+			return e.reject(o.ID, RejectWouldCross)
+		}
+	}
+	e.emit(Event{Kind: EvAccepted, OrderID: o.ID, Side: o.Side, Type: o.Type, Price: o.Price, Qty: o.Qty})
 
+	if o.Type == Limit && o.TIF == FOK && e.available(o, opposite) < o.Qty {
+		e.emit(Event{Kind: EvDiscarded, OrderID: o.ID, Qty: o.Qty})
+		return Result{Status: Discarded, Trades: e.trade, Remaining: o.Qty}
+	}
+
+	selfHit := false
 	for o.Qty > 0 {
 		lv := opposite.best()
 		if lv == nil || !crosses(o.Side, o.Type, o.Price, lv.price) {
 			break
 		}
 		maker := lv.front()
+		if o.Owner != 0 && maker.owner == o.Owner && e.stp != STPNone {
+			if e.stp == STPCancelTaker {
+				selfHit = true
+				break
+			}
+			// STPCancelMaker: the resting order leaves the book, matching continues.
+			e.emit(Event{Kind: EvCancelled, OrderID: maker.id, Side: maker.side, Price: maker.price, Qty: maker.qty, Reject: RejectSelfTrade})
+			e.remove(maker, lv)
+			continue
+		}
 		qty := min(o.Qty, maker.qty)
 		e.trade = append(e.trade, Trade{
 			TakerID: o.ID, MakerID: maker.id, Price: maker.price, Qty: qty,
@@ -115,22 +171,79 @@ func (e *Engine) Process(o Order) Result {
 	res := Result{Status: Filled, Trades: e.trade, Remaining: o.Qty}
 	switch {
 	case o.Qty == 0:
-	case o.Type == Market:
+	case selfHit:
+		res.Status = Discarded
+		e.emit(Event{Kind: EvDiscarded, OrderID: o.ID, Qty: o.Qty, Reject: RejectSelfTrade})
+	case o.Type == Market, o.TIF != GTC:
 		res.Status = Discarded
 		e.emit(Event{Kind: EvDiscarded, OrderID: o.ID, Qty: o.Qty})
 	default:
 		res.Status = Rested
 		e.emit(Event{Kind: EvRested, OrderID: o.ID, Side: o.Side, Price: o.Price, Qty: o.Qty})
-		e.seq++
-		r := &resting{id: o.ID, side: o.Side, price: o.Price, qty: o.Qty, seq: e.seq}
-		e.byID[o.ID] = r
-		if o.Side == Buy {
-			e.bids.add(r)
-		} else {
-			e.asks.add(r)
-		}
+		e.rest(o)
 	}
 	return res
+}
+
+func (e *Engine) reject(id int64, r Reject) Result {
+	e.emit(Event{Kind: EvRejected, OrderID: id, Reject: r})
+	return Result{Status: Rejected, Reject: r, Trades: e.trade}
+}
+
+// rest places the remainder of o on its side of the book.
+func (e *Engine) rest(o Order) {
+	e.seq++
+	r := &resting{id: o.ID, side: o.Side, owner: o.Owner, price: o.Price, qty: o.Qty, seq: e.seq}
+	e.byID[o.ID] = r
+	if o.Side == Buy {
+		e.bids.add(r)
+	} else {
+		e.asks.add(r)
+	}
+}
+
+// remove tombstones a resting order that is currently at the front of lv.
+func (e *Engine) remove(r *resting, lv *level) {
+	r.cancelled = true
+	delete(e.byID, r.id)
+	lv.qty -= r.qty
+	r.qty = 0
+	lv.head++
+}
+
+// available returns how much of o could trade right now, applying the same
+// price and STP rules the match loop would, without touching the book. It
+// stops counting once o.Qty is reached. Used only for fill-or-kill, so its
+// heap copy is off the common hot path.
+func (e *Engine) available(o Order, opposite *sideBook) int64 {
+	e.scratch = append(e.scratch[:0], opposite.heap.prices...)
+	tmp := priceHeap{prices: e.scratch, desc: opposite.heap.desc}
+	var sum int64
+	for tmp.Len() > 0 && sum < o.Qty {
+		price := tmp.prices[0]
+		(&tmp).Pop2()
+		if !crosses(o.Side, o.Type, o.Price, price) {
+			break
+		}
+		lv, ok := opposite.levels[price]
+		if !ok {
+			continue
+		}
+		for i := lv.head; i < len(lv.orders) && sum < o.Qty; i++ {
+			m := lv.orders[i]
+			if m.cancelled || m.qty == 0 {
+				continue
+			}
+			if o.Owner != 0 && m.owner == o.Owner && e.stp != STPNone {
+				if e.stp == STPCancelTaker {
+					return sum
+				}
+				continue // STPCancelMaker skips own liquidity
+			}
+			sum += m.qty
+		}
+	}
+	return sum
 }
 
 // validate checks an order's fields without consulting the book.
@@ -140,6 +253,10 @@ func validate(o Order) Reject {
 		return RejectQty
 	case o.Type == Limit && o.Price <= 0:
 		return RejectPrice
+	case o.TIF > FOK:
+		return RejectTIF
+	case o.PostOnly && o.Type == Market:
+		return RejectWouldCross
 	}
 	return RejectNone
 }
@@ -154,8 +271,13 @@ func (e *Engine) Cancel(id int64) bool {
 		return false
 	}
 	e.emit(Event{Kind: EvCancelled, OrderID: id, Side: r.side, Price: r.price, Qty: r.qty})
+	e.cancel(r)
+	return true
+}
+
+func (e *Engine) cancel(r *resting) {
 	r.cancelled = true
-	delete(e.byID, id)
+	delete(e.byID, r.id)
 	// Adjust the level's live quantity so depth snapshots stay accurate.
 	sb := e.bids
 	if r.side == Sell {
@@ -163,7 +285,42 @@ func (e *Engine) Cancel(id int64) bool {
 	}
 	sb.levels[r.price].qty -= r.qty
 	r.qty = 0
-	return true
+}
+
+// Replace changes the price and resting quantity of a resting order. qty is
+// the new resting quantity, not a total.
+//
+// Priority follows the usual exchange rule: shrinking an order at the same
+// price keeps its place in the queue (EvReduced). Any price change, or a
+// size increase, loses priority: the order is cancelled and re-entered as a
+// new GTC limit order with the same ID and Owner, which may trade
+// immediately. Replace of an unknown ID is rejected with RejectUnknownID.
+func (e *Engine) Replace(id, price, qty int64) Result {
+	e.events = e.events[:0]
+	e.trade = e.trade[:0]
+	r, ok := e.byID[id]
+	switch {
+	case !ok:
+		return e.reject(id, RejectUnknownID)
+	case qty <= 0:
+		return e.reject(id, RejectQty)
+	case price <= 0:
+		return e.reject(id, RejectPrice)
+	}
+	if price == r.price && qty <= r.qty {
+		sb := e.bids
+		if r.side == Sell {
+			sb = e.asks
+		}
+		sb.levels[r.price].qty -= r.qty - qty
+		r.qty = qty
+		e.emit(Event{Kind: EvReduced, OrderID: id, Side: r.side, Price: price, Qty: qty})
+		return Result{Status: Rested, Trades: e.trade, Remaining: qty}
+	}
+	e.emit(Event{Kind: EvCancelled, OrderID: id, Side: r.side, Price: r.price, Qty: r.qty, Reject: RejectReplaced})
+	o := Order{ID: id, Side: r.side, Type: Limit, Price: price, Qty: qty, Owner: r.owner}
+	e.cancel(r)
+	return e.process(o)
 }
 
 // BestBid and BestAsk return the top of book (price, qty, ok).

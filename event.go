@@ -11,6 +11,7 @@ const (
 	EvDiscarded                       // the unfilled remainder of a market order was dropped
 	EvCancelled                       // OrderID left the book with Qty still unfilled
 	EvCancelRejected                  // a cancel named an ID that was not resting
+	EvReduced                         // OrderID shrank in place to Qty, keeping priority
 )
 
 func (k EventKind) String() string {
@@ -27,6 +28,8 @@ func (k EventKind) String() string {
 		return "discarded"
 	case EvCancelled:
 		return "cancelled"
+	case EvReduced:
+		return "reduced"
 	}
 	return "cancel_rejected"
 }
@@ -40,9 +43,12 @@ func (k EventKind) String() string {
 //	EvRejected        OrderID Reject
 //	EvFill            OrderID (taker) MakerID Price Qty
 //	EvRested          OrderID Side Price Qty (Qty is what rests)
-//	EvDiscarded       OrderID Qty
-//	EvCancelled       OrderID Side Price Qty (Qty is what was still unfilled)
+//	EvDiscarded       OrderID Qty; Reject is RejectSelfTrade when STP stopped it
+//	EvCancelled       OrderID Side Price Qty (Qty is what was still unfilled);
+//	                  Reject is RejectSelfTrade or RejectReplaced when the
+//	                  engine, not the owner, removed it
 //	EvCancelRejected  OrderID
+//	EvReduced         OrderID Side Price Qty (Qty is the new resting size)
 type Event struct {
 	Seq     uint64
 	Kind    EventKind
@@ -87,11 +93,13 @@ type CommandKind int8
 const (
 	CmdSubmit CommandKind = iota
 	CmdCancel
+	CmdReplace
 )
 
 // Command is one engine input. The engine is a deterministic function of
 // its command stream, so a journal of commands is a complete record of
-// everything it ever did. For CmdCancel only Order.ID is used.
+// everything it ever did. For CmdCancel only Order.ID is used; for
+// CmdReplace, Order.ID, Order.Price and Order.Qty.
 type Command struct {
 	Kind  CommandKind
 	Order Order

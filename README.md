@@ -17,6 +17,15 @@ throwing random order streams at it and checking the rules always hold.
 ## Features
 
 - **Limit and market orders** with price-time (FIFO) priority and partial fills
+- **Time in force**: GTC rests, IOC fills what crosses and drops the rest,
+  FOK fills completely or not at all (checked before anything trades)
+- **Post-only** orders are rejected rather than allowed to take liquidity
+- **Self-trade prevention** keyed on an owner ID, with a per-engine policy:
+  off, cancel the incoming remainder, or cancel the resting order and keep
+  matching
+- **Cancel-replace with real priority rules**: shrinking an order at the same
+  price keeps its place in the queue; a price change or size increase loses
+  it and re-enters as a new order, which may trade immediately
 - **Price improvement to the taker** — fills always execute at the maker's price
 - **O(1) cancels** via tombstoning with lazy cleanup at the queue head;
   busy levels compact their queue so dead orders never pile up
@@ -83,8 +92,10 @@ Reproduce with a fixed seed: the flow generator is deterministic (`-seed`).
 
 - **Property-based suite**: 300 random scenarios × 400 operations, each
   cross-checked operation-by-operation against a naive O(n) reference
-  implementation — status, trades, cancels, top-of-book, and final depth
-  must be identical. The stream includes duplicate IDs and invalid prices.
+  implementation — status, trades, cancels, replaces, top-of-book, and depth
+  must be identical. The stream mixes GTC, IOC, FOK, post-only and market
+  orders, owners from a small pool so self-trades happen, replaces, duplicate
+  IDs and invalid prices, and the self-trade policy rotates across scenarios.
   The book-never-crossed invariant is asserted after every op.
 - **Fuzzing**: `go test -fuzz=FuzzEngineVsReference` decodes arbitrary bytes
   into order streams and checks the engine against the reference model, so
@@ -99,8 +110,9 @@ Reproduce with a fixed seed: the flow generator is deterministic (`-seed`).
 - **Journal robustness**: a journal torn mid-record replays the whole records
   before the tear and reports the tear; corrupt records and bad snapshots
   are refused, including one that would restore a crossed book.
-- **Conservation property**: every unit of submitted quantity is provably
-  filled, resting, cancelled, or discarded (market IOC remainder).
+- **Conservation property**: read from the engine's own event stream, every
+  unit of accepted quantity is provably filled, resting, cancelled, reduced,
+  or discarded, under every self-trade policy.
 - Table-driven unit tests for FIFO priority, price priority, partial fills,
   price improvement, IOC semantics, cancels, duplicate-ID rejection, input
   validation, and level compaction.
@@ -118,6 +130,13 @@ res := eng.Process(matchbook.Order{ID: 2, Side: matchbook.Buy, Type: matchbook.L
 
 dup := eng.Process(matchbook.Order{ID: 1, Side: matchbook.Sell, Type: matchbook.Limit, Price: 101, Qty: 1})
 // dup.Status: Rejected, dup.Reject: RejectDuplicateID — the book is untouched
+
+// Order types: TIF, post-only and owner are plain fields.
+eng.Process(matchbook.Order{ID: 3, Owner: 7, Side: matchbook.Buy, Type: matchbook.Limit, TIF: matchbook.FOK, Price: 100, Qty: 50})
+// Status: Discarded, Remaining: 50 — not enough liquidity, nothing traded
+eng.Replace(1, 100, 2) // same price, smaller: keeps queue priority, emits EvReduced
+
+stp := matchbook.NewEngine(matchbook.WithSelfTradePrevention(matchbook.STPCancelMaker))
 
 // Every call also emits sequenced events, e.g. for the fill above:
 // [{Seq:3 Kind:accepted OrderID:2 ...} {Seq:4 Kind:fill OrderID:2 MakerID:1 Price:100 Qty:4}]

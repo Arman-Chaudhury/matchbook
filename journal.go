@@ -15,14 +15,15 @@ import (
 //
 // Layout: 4-byte magic, then records of recordSize bytes, little-endian:
 //
-//	kind(1) side(1) type(1) pad(1) id(8) price(8) qty(8)
+//	kind(1) side(1) type(1) tif(1) postonly(1) pad(3) id(8) owner(8) price(8) qty(8)
 const (
-	journalMagic = "MBJ1"
-	recordSize   = 28
+	journalMagic = "MBJ2"
+	recordSize   = 40
 )
 
 var (
-	// ErrBadMagic means the reader was not positioned at a matchbook journal.
+	// ErrBadMagic means the reader was not positioned at a matchbook journal
+	// of this version.
 	ErrBadMagic = errors.New("matchbook: not a journal (bad magic)")
 	// ErrTornRecord means the journal ended partway through a record. The
 	// commands before it were replayed; the partial one was dropped.
@@ -52,28 +53,37 @@ func (j *Journal) Append(c Command) error {
 }
 
 func encodeCommand(b *[recordSize]byte, c Command) {
+	*b = [recordSize]byte{}
 	b[0] = byte(c.Kind)
 	b[1] = byte(c.Order.Side)
 	b[2] = byte(c.Order.Type)
-	b[3] = 0
-	binary.LittleEndian.PutUint64(b[4:], uint64(c.Order.ID))
-	binary.LittleEndian.PutUint64(b[12:], uint64(c.Order.Price))
-	binary.LittleEndian.PutUint64(b[20:], uint64(c.Order.Qty))
+	b[3] = byte(c.Order.TIF)
+	if c.Order.PostOnly {
+		b[4] = 1
+	}
+	binary.LittleEndian.PutUint64(b[8:], uint64(c.Order.ID))
+	binary.LittleEndian.PutUint64(b[16:], uint64(c.Order.Owner))
+	binary.LittleEndian.PutUint64(b[24:], uint64(c.Order.Price))
+	binary.LittleEndian.PutUint64(b[32:], uint64(c.Order.Qty))
 }
 
 func decodeCommand(b *[recordSize]byte) (Command, error) {
 	c := Command{
 		Kind: CommandKind(b[0]),
 		Order: Order{
-			Side:  Side(b[1]),
-			Type:  Type(b[2]),
-			ID:    int64(binary.LittleEndian.Uint64(b[4:])),
-			Price: int64(binary.LittleEndian.Uint64(b[12:])),
-			Qty:   int64(binary.LittleEndian.Uint64(b[20:])),
+			Side:     Side(b[1]),
+			Type:     Type(b[2]),
+			TIF:      TimeInForce(b[3]),
+			PostOnly: b[4] == 1,
+			ID:       int64(binary.LittleEndian.Uint64(b[8:])),
+			Owner:    int64(binary.LittleEndian.Uint64(b[16:])),
+			Price:    int64(binary.LittleEndian.Uint64(b[24:])),
+			Qty:      int64(binary.LittleEndian.Uint64(b[32:])),
 		},
 	}
-	if c.Kind > CmdCancel || c.Order.Side > Sell || c.Order.Type > Market || b[3] != 0 {
-		return Command{}, fmt.Errorf("matchbook: corrupt journal record %x", b[:4])
+	if c.Kind > CmdReplace || c.Order.Side > Sell || c.Order.Type > Market ||
+		b[4] > 1 || b[5] != 0 || b[6] != 0 || b[7] != 0 {
+		return Command{}, fmt.Errorf("matchbook: corrupt journal record %x", b[:8])
 	}
 	return c, nil
 }
