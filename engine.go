@@ -5,19 +5,55 @@ package matchbook
 // makes an exchange core testable, and a single goroutine owning the book
 // avoids locks entirely (shard by instrument to scale out).
 type Engine struct {
-	bids  *sideBook
-	asks  *sideBook
-	byID  map[int64]*resting
-	seq   uint64
-	trade []Trade // reused buffer to keep the hot path allocation-free
+	bids   *sideBook
+	asks   *sideBook
+	byID   map[int64]*resting
+	seq    uint64
+	trade  []Trade // reused buffer to keep the hot path allocation-free
+	events []Event // reused buffer: events emitted by the last command
+	evSeq  uint64  // sequence number of the last event emitted
+	digest uint64  // FNV-1a over every event ever emitted
 }
 
 func NewEngine() *Engine {
 	return &Engine{
-		bids: newSideBook(true),
-		asks: newSideBook(false),
-		byID: make(map[int64]*resting),
+		bids:   newSideBook(true),
+		asks:   newSideBook(false),
+		byID:   make(map[int64]*resting),
+		digest: fnv64Offset,
 	}
+}
+
+// Apply runs one command and returns the events it produced. It is the
+// single entry point a journal replays through, and it is exactly
+// equivalent to calling Process or Cancel.
+func (e *Engine) Apply(c Command) []Event {
+	if c.Kind == CmdCancel {
+		e.Cancel(c.Order.ID)
+	} else {
+		e.Process(c.Order)
+	}
+	return e.events
+}
+
+// Events returns the events emitted by the most recent Process, Cancel or
+// Apply call, in order. The slice is only valid until the next call.
+func (e *Engine) Events() []Event { return e.events }
+
+// Digest is a running FNV-1a hash of every event the engine has emitted.
+// Two engines that have consumed the same command stream have the same
+// digest; replaying a journal and comparing digests proves the replay
+// reproduced every output exactly.
+func (e *Engine) Digest() uint64 { return e.digest }
+
+// EventSeq is the sequence number of the last event emitted.
+func (e *Engine) EventSeq() uint64 { return e.evSeq }
+
+func (e *Engine) emit(ev Event) {
+	e.evSeq++
+	ev.Seq = e.evSeq
+	e.events = append(e.events, ev)
+	e.digest = ev.digest(e.digest)
 }
 
 // crosses reports whether a taker at takerPrice trades against a maker
@@ -39,13 +75,17 @@ func crosses(side Side, typ Type, takerPrice, makerPrice int64) bool {
 //
 // Result.Trades is only valid until the next call to Process.
 func (e *Engine) Process(o Order) Result {
+	e.events = e.events[:0]
+	e.trade = e.trade[:0]
 	if r := validate(o); r != RejectNone {
+		e.emit(Event{Kind: EvRejected, OrderID: o.ID, Reject: r})
 		return Result{Status: Rejected, Reject: r}
 	}
 	if _, dup := e.byID[o.ID]; dup {
+		e.emit(Event{Kind: EvRejected, OrderID: o.ID, Reject: RejectDuplicateID})
 		return Result{Status: Rejected, Reject: RejectDuplicateID}
 	}
-	e.trade = e.trade[:0]
+	e.emit(Event{Kind: EvAccepted, OrderID: o.ID, Side: o.Side, Type: o.Type, Price: o.Price, Qty: o.Qty})
 
 	opposite := e.asks
 	if o.Side == Sell {
@@ -62,6 +102,7 @@ func (e *Engine) Process(o Order) Result {
 		e.trade = append(e.trade, Trade{
 			TakerID: o.ID, MakerID: maker.id, Price: maker.price, Qty: qty,
 		})
+		e.emit(Event{Kind: EvFill, OrderID: o.ID, MakerID: maker.id, Price: maker.price, Qty: qty})
 		o.Qty -= qty
 		maker.qty -= qty
 		lv.qty -= qty
@@ -76,8 +117,10 @@ func (e *Engine) Process(o Order) Result {
 	case o.Qty == 0:
 	case o.Type == Market:
 		res.Status = Discarded
+		e.emit(Event{Kind: EvDiscarded, OrderID: o.ID, Qty: o.Qty})
 	default:
 		res.Status = Rested
+		e.emit(Event{Kind: EvRested, OrderID: o.ID, Side: o.Side, Price: o.Price, Qty: o.Qty})
 		e.seq++
 		r := &resting{id: o.ID, side: o.Side, price: o.Price, qty: o.Qty, seq: e.seq}
 		e.byID[o.ID] = r
@@ -104,10 +147,13 @@ func validate(o Order) Reject {
 // Cancel removes a resting order by ID. Returns false if unknown (already
 // filled, cancelled, or never rested).
 func (e *Engine) Cancel(id int64) bool {
+	e.events = e.events[:0]
 	r, ok := e.byID[id]
 	if !ok {
+		e.emit(Event{Kind: EvCancelRejected, OrderID: id})
 		return false
 	}
+	e.emit(Event{Kind: EvCancelled, OrderID: id, Side: r.side, Price: r.price, Qty: r.qty})
 	r.cancelled = true
 	delete(e.byID, id)
 	// Adjust the level's live quantity so depth snapshots stay accurate.

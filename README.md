@@ -22,6 +22,14 @@ throwing random order streams at it and checking the rules always hold.
   busy levels compact their queue so dead orders never pile up
 - **Explicit outcomes**: every order comes back as rested, filled, discarded,
   or rejected with a reason (bad quantity, bad price, duplicate ID)
+- **Sequenced event stream**: every command emits gap-free numbered events
+  (accepted, fill, rested, discarded, cancelled, rejected) that are enough to
+  rebuild the book and every trade downstream, plus a running digest of all
+  events ever emitted
+- **Journal, snapshot, and replay**: commands append to a fixed-width binary
+  journal; replaying it into a fresh engine reproduces the exact same events
+  and digest. A snapshot captures the resting book so recovery is snapshot
+  plus the journal tail, not the whole history
 - **Aggregated depth snapshots** (top-N levels per side)
 - **Allocation-conscious hot path** — the trade buffer is reused across calls;
   integer tick prices keep floats out of the matching path entirely
@@ -84,6 +92,13 @@ Reproduce with a fixed seed: the flow generator is deterministic (`-seed`).
 - **Golden determinism test**: a fixed 50,000-operation stream must hash to
   the same value on every run and every machine. If behaviour changes, this
   test says so.
+- **Replay and recovery properties**: a journaled random stream replayed into
+  a fresh engine must reproduce the same event digest and depth. Separately,
+  the engine is stopped at a random point, snapshotted, restored, and both
+  copies are fed the rest of the stream; every event must be identical.
+- **Journal robustness**: a journal torn mid-record replays the whole records
+  before the tear and reports the tear; corrupt records and bad snapshots
+  are refused, including one that would restore a crossed book.
 - **Conservation property**: every unit of submitted quantity is provably
   filled, resting, cancelled, or discarded (market IOC remainder).
 - Table-driven unit tests for FIFO priority, price priority, partial fills,
@@ -103,6 +118,25 @@ res := eng.Process(matchbook.Order{ID: 2, Side: matchbook.Buy, Type: matchbook.L
 
 dup := eng.Process(matchbook.Order{ID: 1, Side: matchbook.Sell, Type: matchbook.Limit, Price: 101, Qty: 1})
 // dup.Status: Rejected, dup.Reject: RejectDuplicateID — the book is untouched
+
+// Every call also emits sequenced events, e.g. for the fill above:
+// [{Seq:3 Kind:accepted OrderID:2 ...} {Seq:4 Kind:fill OrderID:2 MakerID:1 Price:100 Qty:4}]
+events := eng.Events()
+```
+
+Journal commands as they arrive, and recover from a snapshot plus the
+journal written after it:
+
+```go
+j, _ := matchbook.NewJournal(w)          // w is any io.Writer, e.g. a file
+cmd := matchbook.Command{Kind: matchbook.CmdSubmit, Order: o}
+j.Append(cmd)
+eng.Apply(cmd)
+
+eng.Snapshot(snapW)                      // periodically
+fresh, _ := matchbook.Restore(snapR)     // on restart
+matchbook.Replay(journalTailR, fresh)    // then apply the commands since
+fresh.Digest() == eng.Digest()           // proves nothing was lost
 
 bid, qty, ok := eng.BestBid()
 depth := eng.Depth(matchbook.Sell, 5)
