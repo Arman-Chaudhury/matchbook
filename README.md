@@ -10,8 +10,9 @@ matchbook is my version of that core, written in Go. It handles one instrument
 on one thread with no locks, which is what makes it predictable. Orders are
 matched by price first and then by who got there first, big orders can fill
 partially, cancelling is instant, and it can report how much buying and selling
-interest sits at each price. It processes about 2 million orders per second
-with a typical latency of a third of a microsecond, and it is tested by
+interest sits at each price. On a realistic order flow it handles about 13
+million commands per second on a laptop, with half of them done in under 85
+nanoseconds, and it allocates no memory once warmed up. It is tested by
 throwing random order streams at it and checking the rules always hold.
 
 ## Features
@@ -27,8 +28,8 @@ throwing random order streams at it and checking the rules always hold.
   price keeps its place in the queue; a price change or size increase loses
   it and re-enters as a new order, which may trade immediately
 - **Price improvement to the taker** — fills always execute at the maker's price
-- **O(1) cancels** via tombstoning with lazy cleanup at the queue head;
-  busy levels compact their queue so dead orders never pile up
+- **O(1) cancels**: each price level is an intrusive linked list, so a cancel
+  unlinks its order wherever it sits and nothing dead is left in the queue
 - **Explicit outcomes**: every order comes back as rested, filled, discarded,
   or rejected with a reason (bad quantity, bad price, duplicate ID)
 - **Sequenced event stream**: every command emits gap-free numbered events
@@ -40,8 +41,10 @@ throwing random order streams at it and checking the rules always hold.
   and digest. A snapshot captures the resting book so recovery is snapshot
   plus the journal tail, not the whole history
 - **Aggregated depth snapshots** (top-N levels per side)
-- **Allocation-conscious hot path** — the trade buffer is reused across calls;
-  integer tick prices keep floats out of the matching path entirely
+- **Zero allocation in steady state**: resting orders and price levels are
+  recycled through a pool, the trade and event buffers are reused, and the
+  price heap never boxes values. Tests assert that warmed-up quote churn
+  allocates nothing. Integer tick prices keep floats out of matching entirely
 
 ## Architecture
 
@@ -54,39 +57,91 @@ flowchart LR
         X --> T[trades out]
     end
     subgraph Book [order book]
-        B[bids: max-heap of price levels]
-        A[asks: min-heap of price levels]
-        L["level = FIFO queue + live qty"]
+        B[bids: max-heap of levels]
+        A[asks: min-heap of levels]
+        L["level = linked FIFO list + live qty"]
+        I["ID index: order ID to order"]
         B --> L
         A --> L
+        I --> L
     end
     P -.-> B
     P -.-> A
 ```
 
-Each side of the book is a hash map of price → level plus a binary heap of
-prices for best-price access. Levels are FIFO queues with an advancing head
-index, so dequeue never reallocates. Emptied levels and cancelled orders are
-pruned lazily when they surface at the top — cancels stay O(1) and the heap
-never needs random deletion.
+Each side of the book keeps a binary heap of price levels, so the best price
+is one slice read, and a map from price to level that is only consulted when
+an order rests. Each level is a doubly linked list of orders in arrival
+order, and every order points back at its level. That makes fills, cancels
+and in-place reductions O(1) with no lookup. Emptied levels are pruned
+lazily when they reach the top of the heap, so the heap never needs random
+deletion. Filled and cancelled orders, and pruned levels, go back to a pool
+and are reused, which is why steady-state trading does not allocate.
+
+The remaining map is the order-ID index, which arbitrary client IDs require.
+Profiling shows it is now most of the map cost. A fixed-range price ladder
+was considered and rejected. The price map accounts for about 2% of engine
+time, and a ladder would force every caller to declare a price range up
+front.
 
 Scaling out is by sharding: one engine goroutine per instrument, orders routed
 by symbol. Nothing in the core needs a mutex.
 
 ## Benchmarks
 
-`go run ./cmd/bench -n 2000000` on an 8-core Intel Mac (go1.26.5), seeded
-random flow (90% limit / 10% market, narrow price band for heavy crossing):
+All numbers below come from one machine and one method: an Apple M1 MacBook
+Pro with 8 GB of memory on macOS 26.4, Go 1.27.2. Each row is the
+median of five runs of `go run ./cmd/bench`, 2 million commands each.
 
-| metric | value |
-|---|---|
-| sustained throughput | **2.08M orders/sec** |
-| latency p50 | 0.30 µs |
-| latency p95 | 0.69 µs |
-| latency p99 | 1.14 µs |
-| trades generated | 1.72M from 2M orders |
+**The workload.** The headline flow is *stationary*: the book holds about
+1,300 to 1,700 resting orders around a drifting mid price, the way a live
+book does. A third of commands are cancels of live orders. The rest are
+mostly passive quotes near the touch, with some aggressive limits and a few
+market orders, producing about 630,000 trades. The stream is generated by
+`internal/flow` and is deterministic, so every run does identical work, and
+the bench checks that by comparing digests.
 
-Reproduce with a fixed seed: the flow generator is deterministic (`-seed`).
+The original benchmark flow is kept as *growing*: uniform prices over 40
+ticks, 10% market orders, no cancels. About one order in eight rests forever,
+so the book grows without bound. It is a stress test, not a model of a
+market. Earlier versions of this README quoted it as the headline number.
+
+**How it is measured.** Throughput comes from a pass with no clock reads in
+the loop. Latency comes from a second pass that times each command. The clock
+on this machine ticks every 42 ns, so every latency is a multiple of 42 ns and
+includes about 16 ns of measurement cost. Allocation is total bytes allocated
+divided by commands.
+
+| | stationary, before | stationary, now | growing, before | growing, now |
+|---|---|---|---|---|
+| throughput | 10.4M/s | **13.4M/s** | 5.8M/s | **8.1M/s** |
+| time per command | 96 ns | **75 ns** | 172 ns | **124 ns** |
+| latency p50 | 83 ns | 83 ns | 166 ns | 125 ns |
+| latency p99 | 333 ns | **167 ns** | 500 ns | 375 ns |
+| latency p99.9 | 667 ns | **250 ns** | 2,042 ns | 875 ns |
+| bytes allocated per command | 42.9 | **0.17** | 77.4 | 19.9 |
+
+"Before" is the engine as of the order-types release, measured with the same
+harness and the same streams. The 0.17 bytes per command on the stationary
+flow is the pool filling up during the first few thousand commands; after
+that, nothing is allocated. The growing flow still allocates because its book
+really does grow.
+
+The maximum latency in any run is tens of microseconds and varies run to run.
+Those outliers come from the operating system, not the engine, and are not
+reported as a figure. A run occasionally comes out much slower overall when
+the laptop is busy with something else, which is why medians are used.
+
+Per-operation microbenchmarks with allocation counts live in
+`bench_test.go`. On pull requests, CI runs them on the base and the head and
+posts a benchstat comparison. To compare locally:
+
+```
+go test -run='^$' -bench=. -benchmem -count=10 > old.txt
+# change something
+go test -run='^$' -bench=. -benchmem -count=10 > new.txt
+go run golang.org/x/perf/cmd/benchstat@v0.0.0-20261009192801-be2c69fb417e old.txt new.txt
+```
 
 ## Testing
 
@@ -113,10 +168,16 @@ Reproduce with a fixed seed: the flow generator is deterministic (`-seed`).
 - **Conservation property**: read from the engine's own event stream, every
   unit of accepted quantity is provably filled, resting, cancelled, reduced,
   or discarded, under every self-trade policy.
+- **Recycling invariants**: after long random streams under every self-trade
+  policy, a checker walks every level's list and verifies the links, FIFO
+  order, totals, and that no order or level is both in use and in the pool.
+  A deliberately planted double-recycle bug was confirmed to fail it.
+- **Zero-allocation tests**: warmed-up quote churn, at the front of a level
+  and behind a live order, must allocate nothing.
 - Table-driven unit tests for FIFO priority, price priority, partial fills,
   price improvement, IOC semantics, cancels, duplicate-ID rejection, input
-  validation, and level compaction.
-- `go test -race -cover ./...` → **99.3% statement coverage**, race-clean.
+  validation, and cancels that would once have leaked queue slots.
+- `go test -race -cover ./...` gives **99.4% statement coverage**, race-clean.
 
 ## Usage
 
