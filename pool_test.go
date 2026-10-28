@@ -42,20 +42,39 @@ func checkPool(t *testing.T, e *Engine) {
 			if pooledLevels[lv] {
 				t.Fatalf("live level %d is also in the pool", p)
 			}
-			dead := 0
-			for _, r := range lv.orders[lv.head:] {
+			// Walk the list forwards checking links, membership and totals.
+			count, qty := 0, int64(0)
+			var prev *resting
+			var lastSeq uint64
+			for r := lv.head; r != nil; r = r.next {
 				if pooled[r] {
 					t.Fatalf("level %d queue holds recycled order %p", p, r)
 				}
-				if r.cancelled {
-					dead++
+				if r.prev != prev {
+					t.Fatalf("level %d: order %d has a broken prev link", p, r.id)
 				}
-				if r.lv != lv {
+				if r.lv != lv || r.price != p {
 					t.Fatalf("order %d in level %d points at a different level", r.id, p)
 				}
+				if e.byID[r.id] != r {
+					t.Fatalf("order %d is queued but not indexed", r.id)
+				}
+				if r.qty <= 0 {
+					t.Fatalf("order %d is queued with qty %d", r.id, r.qty)
+				}
+				if r.seq <= lastSeq {
+					t.Fatalf("level %d is out of FIFO order at order %d", p, r.id)
+				}
+				lastSeq = r.seq
+				prev = r
+				count++
+				qty += r.qty
 			}
-			if dead != lv.dead {
-				t.Fatalf("level %d counts %d tombstones, queue has %d", p, lv.dead, dead)
+			if lv.tail != prev {
+				t.Fatalf("level %d tail does not match the last node", p)
+			}
+			if count != lv.count || qty != lv.qty {
+				t.Fatalf("level %d records %d orders/%d qty, list holds %d/%d", p, lv.count, lv.qty, count, qty)
 			}
 		}
 	}
@@ -104,11 +123,12 @@ func TestSteadyStateDoesNotAllocate(t *testing.T) {
 	}
 }
 
-// TestMidQueueTombstonesAreSwept pins the second leak: an order at the
-// front of a level stays live while orders behind it are cancelled or
-// re-priced over and over. Head never moves, so head-based compaction never
-// runs, and without a sweep the queue grows by one dead slot per cancel.
-func TestMidQueueTombstonesAreSwept(t *testing.T) {
+// TestMidQueueCancelsLeaveNothingBehind pins a leak the slice-and-tombstone
+// queue had: an order at the front of a level stays live while orders
+// behind it are cancelled or re-priced over and over. With tombstones the
+// queue grew by one dead slot per cancel; with the linked list a cancel
+// unlinks and recycles its order at once.
+func TestMidQueueCancelsLeaveNothingBehind(t *testing.T) {
 	e := NewEngine()
 	e.Process(limit(1, Buy, 100, 5)) // stays at the front the whole time
 	for i := int64(2); i < 20_000; i++ {
@@ -120,11 +140,8 @@ func TestMidQueueTombstonesAreSwept(t *testing.T) {
 		}
 	}
 	lv := e.bids.levels[100]
-	if live := len(lv.orders) - lv.head - lv.dead; live != 1 {
-		t.Fatalf("level 100 should hold 1 live order, has %d", live)
-	}
-	if len(lv.orders) > 2*compactAt+2 {
-		t.Fatalf("level 100 retained %d slots for 1 live order", len(lv.orders))
+	if lv.count != 1 || lv.head != lv.tail {
+		t.Fatalf("level 100 should hold exactly 1 order, has %d", lv.count)
 	}
 	if p, q, _ := e.BestBid(); p != 100 || q != 5 {
 		t.Fatalf("best bid %d/%d, want 100/5", p, q)

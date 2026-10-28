@@ -167,7 +167,7 @@ func (e *Engine) process(o Order) Result {
 		lv.qty -= qty
 		if maker.qty == 0 {
 			delete(e.byID, maker.id)
-			lv.pop()
+			lv.unlink(maker)
 		}
 	}
 
@@ -206,13 +206,12 @@ func (e *Engine) rest(o Order) {
 	}
 }
 
-// remove tombstones a resting order that is currently at the front of lv.
-// It pops the order straight away, so it never becomes a tombstone.
+// remove takes a resting order off the book for self-trade prevention and
+// recycles it.
 func (e *Engine) remove(r *resting, lv *level) {
 	delete(e.byID, r.id)
 	lv.qty -= r.qty
-	r.qty = 0
-	lv.pop()
+	lv.unlink(r)
 }
 
 // available returns how much of o could trade right now, applying the same
@@ -229,11 +228,7 @@ func (e *Engine) available(o Order, opposite *sideBook) int64 {
 		if !crosses(o.Side, o.Type, o.Price, lv.price) {
 			break
 		}
-		for i := lv.head; i < len(lv.orders) && sum < o.Qty; i++ {
-			m := lv.orders[i]
-			if m.cancelled || m.qty == 0 {
-				continue
-			}
+		for m := lv.head; m != nil && sum < o.Qty; m = m.next {
 			if o.Owner != 0 && m.owner == o.Owner && e.stp != STPNone {
 				if e.stp == STPCancelTaker {
 					return sum
@@ -275,14 +270,12 @@ func (e *Engine) Cancel(id int64) bool {
 	return true
 }
 
+// cancel unlinks a resting order and recycles it. Callers must not use r
+// afterwards.
 func (e *Engine) cancel(r *resting) {
-	r.cancelled = true
 	delete(e.byID, r.id)
-	// Adjust the level's live quantity so depth snapshots stay accurate.
-	lv := r.lv
-	lv.qty -= r.qty
-	r.qty = 0
-	lv.tombstone() // may sweep and recycle r; callers must not use r after this
+	r.lv.qty -= r.qty
+	r.lv.unlink(r)
 }
 
 // Replace changes the price and resting quantity of a resting order. qty is

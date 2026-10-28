@@ -199,8 +199,8 @@ func TestLevelCompaction(t *testing.T) {
 	if lv == nil {
 		t.Fatal("level 100 should still exist until pruned")
 	}
-	if len(lv.orders) > 2*compactAt {
-		t.Fatalf("level retained %d slots (head=%d), want at most %d", len(lv.orders), lv.head, 2*compactAt)
+	if lv.count != 0 || lv.head != nil || lv.qty != 0 {
+		t.Fatalf("level retained %d orders, qty %d, after every order filled", lv.count, lv.qty)
 	}
 	// Compaction must not break FIFO or cancels of orders still queued.
 	e.Process(limit(n*3+1, Buy, 100, 1))
