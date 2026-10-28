@@ -59,7 +59,7 @@ func (p *pool) putLevel(lv *level) {
 	} else {
 		lv.orders = lv.orders[:0]
 	}
-	lv.head, lv.qty = 0, 0
+	lv.head, lv.qty, lv.dead = 0, 0, 0
 	p.levels = append(p.levels, lv)
 }
 
@@ -70,6 +70,7 @@ type level struct {
 	orders []*resting
 	head   int
 	qty    int64 // live quantity at this level (excludes tombstones)
+	dead   int   // tombstones at or after head
 	pool   *pool
 }
 
@@ -81,8 +82,41 @@ func (l *level) push(r *resting) {
 // pop advances head past the order at the front, which the caller has
 // finished with, and recycles it.
 func (l *level) pop() {
-	l.pool.putOrder(l.orders[l.head])
+	r := l.orders[l.head]
+	if r.cancelled {
+		l.dead--
+	}
+	l.pool.putOrder(r)
 	l.head++
+}
+
+// tombstone records that an order somewhere in this queue was cancelled.
+// Head-based compaction only reclaims dead slots once head reaches them,
+// which never happens while the order at the front stays live. So when
+// tombstones pass compactAt and outnumber live orders, sweep them out.
+func (l *level) tombstone() {
+	l.dead++
+	if l.dead >= compactAt && l.dead*2 > len(l.orders)-l.head {
+		l.sweep()
+	}
+}
+
+// sweep rewrites the queue keeping only live orders, in their original
+// order, and recycles the tombstones. Cost is linear in the queue, paid at
+// most once per compactAt cancels, so amortised O(1) per cancel.
+func (l *level) sweep() {
+	n := 0
+	for _, r := range l.orders[l.head:] {
+		if r.cancelled {
+			l.pool.putOrder(r)
+			continue
+		}
+		l.orders[n] = r
+		n++
+	}
+	clear(l.orders[n:])
+	l.orders = l.orders[:n]
+	l.head, l.dead = 0, 0
 }
 
 // compactAt is the number of consumed slots a level tolerates before its

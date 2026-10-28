@@ -207,8 +207,8 @@ func (e *Engine) rest(o Order) {
 }
 
 // remove tombstones a resting order that is currently at the front of lv.
+// It pops the order straight away, so it never becomes a tombstone.
 func (e *Engine) remove(r *resting, lv *level) {
-	r.cancelled = true
 	delete(e.byID, r.id)
 	lv.qty -= r.qty
 	r.qty = 0
@@ -287,8 +287,10 @@ func (e *Engine) cancel(r *resting) {
 	if r.side == Sell {
 		sb = e.asks
 	}
-	sb.levels[r.price].qty -= r.qty
+	lv := sb.levels[r.price]
+	lv.qty -= r.qty
 	r.qty = 0
+	lv.tombstone() // may sweep and recycle r; callers must not use r after this
 }
 
 // Replace changes the price and resting quantity of a resting order. qty is

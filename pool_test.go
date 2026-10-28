@@ -1,6 +1,9 @@
 package matchbook
 
-import "testing"
+import (
+	"reflect"
+	"testing"
+)
 
 // checkPool asserts the recycling invariants: nothing is in the pool twice,
 // and nothing in the pool is still reachable, either through the ID index
@@ -39,10 +42,17 @@ func checkPool(t *testing.T, e *Engine) {
 			if pooledLevels[lv] {
 				t.Fatalf("live level %d is also in the pool", p)
 			}
+			dead := 0
 			for _, r := range lv.orders[lv.head:] {
 				if pooled[r] {
 					t.Fatalf("level %d queue holds recycled order %p", p, r)
 				}
+				if r.cancelled {
+					dead++
+				}
+			}
+			if dead != lv.dead {
+				t.Fatalf("level %d counts %d tombstones, queue has %d", p, lv.dead, dead)
 			}
 		}
 	}
@@ -88,5 +98,56 @@ func TestSteadyStateDoesNotAllocate(t *testing.T) {
 	})
 	if allocs != 0 {
 		t.Fatalf("rest+cancel churn allocates %.1f times per 2000 cycles after warm-up, want 0", allocs)
+	}
+}
+
+// TestMidQueueTombstonesAreSwept pins the second leak: an order at the
+// front of a level stays live while orders behind it are cancelled or
+// re-priced over and over. Head never moves, so head-based compaction never
+// runs, and without a sweep the queue grows by one dead slot per cancel.
+func TestMidQueueTombstonesAreSwept(t *testing.T) {
+	e := NewEngine()
+	e.Process(limit(1, Buy, 100, 5)) // stays at the front the whole time
+	for i := int64(2); i < 20_000; i++ {
+		e.Process(limit(i, Buy, 100, 1))
+		if i%2 == 0 {
+			e.Cancel(i)
+		} else {
+			e.Replace(i, 99, 1) // moves away from level 100
+		}
+	}
+	lv := e.bids.levels[100]
+	if live := len(lv.orders) - lv.head - lv.dead; live != 1 {
+		t.Fatalf("level 100 should hold 1 live order, has %d", live)
+	}
+	if len(lv.orders) > 2*compactAt+2 {
+		t.Fatalf("level 100 retained %d slots for 1 live order", len(lv.orders))
+	}
+	if p, q, _ := e.BestBid(); p != 100 || q != 5 {
+		t.Fatalf("best bid %d/%d, want 100/5", p, q)
+	}
+	// FIFO must survive sweeps: order 1 first, then the oldest at 99.
+	got := e.Process(market(1_000_000, Sell, 6)).Trades
+	want := []Trade{{TakerID: 1_000_000, MakerID: 1, Price: 100, Qty: 5}, {TakerID: 1_000_000, MakerID: 3, Price: 99, Qty: 1}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("trades %v, want %v", got, want)
+	}
+	checkPool(t, e)
+}
+
+func TestMidQueueChurnDoesNotAllocate(t *testing.T) {
+	e := NewEngine()
+	e.Process(limit(1, Buy, 100, 5))
+	next := int64(2)
+	churn := func() {
+		for i := 0; i < 1000; i++ {
+			e.Process(limit(next, Buy, 100, 1))
+			e.Cancel(next)
+			next++
+		}
+	}
+	churn()
+	if allocs := testing.AllocsPerRun(20, churn); allocs != 0 {
+		t.Fatalf("mid-queue churn allocates %.1f times per 1000 cycles, want 0", allocs)
 	}
 }
