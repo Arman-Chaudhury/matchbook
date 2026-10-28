@@ -13,7 +13,9 @@ partially, cancelling is instant, and it can report how much buying and selling
 interest sits at each price. On a realistic order flow it handles about 13
 million commands per second on a laptop, with half of them done in under 85
 nanoseconds, and it allocates no memory once warmed up. It is tested by
-throwing random order streams at it and checking the rules always hold.
+throwing random order streams at it and checking the rules always hold, and
+by replaying a full day of real NASDAQ order messages through it and
+checking that its book matches the exchange's after every message.
 
 ## Features
 
@@ -143,6 +145,76 @@ go test -run='^$' -bench=. -benchmem -count=10 > new.txt
 go run golang.org/x/perf/cmd/benchstat@v0.0.0-20261009192801-be2c69fb417e old.txt new.txt
 ```
 
+## Replaying real NASDAQ data
+
+NASDAQ publishes full trading days of its TotalView-ITCH 5.0 feed. The feed
+lists every displayed order added, executed, cancelled, deleted or replaced,
+with NASDAQ's own order references. `cmd/itchreplay` drives one engine per
+symbol from that feed. Next to each engine it keeps a second book built only
+from the messages, with no matching logic, as an independent record.
+
+Two things are checked:
+
+- **The book.** After every message, the engine's best bid and ask and their
+  sizes must equal the feed's. The full depth is compared level by level
+  every 10,000 messages and at the close.
+- **Priority.** When NASDAQ reports that a resting order executed, the
+  engine must agree that this order was first in line at the best price.
+  The trade is then replayed through the engine's real matching code, and
+  the fill must be exactly that order, at its price, for the reported size.
+
+Results for 30 December 2019, a full day for five symbols:
+
+| symbol | messages | executions | replayed with NASDAQ's exact fill | receipt-order cases | unexplained |
+|---|---|---|---|---|---|
+| AAPL | 1,519,864 | 60,203 | 59,552 | 651 | 0 |
+| AMZN | 536,078 | 15,094 | 14,692 | 402 | 0 |
+| INTC | 753,342 | 18,892 | 18,872 | 20 | 0 |
+| MSFT | 1,221,477 | 34,739 | 33,664 | 1,075 | 0 |
+| QQQ | 2,376,742 | 21,075 | 20,921 | 154 | 0 |
+
+The engine's top of book matched the feed after all 6.4 million messages,
+and all 642 full-depth comparisons matched. No execution went to an order
+away from the best price, and none produced a different fill. The replay
+takes under 8 seconds.
+
+**The receipt-order cases.** About 1.5% of executions went to a different
+order at the best price than the one the engine had first. Every one
+follows the same pattern. NASDAQ executed an order that appeared in the
+feed later but carries a lower order reference. NASDAQ assigns references
+when it receives an order, so these are orders it received earlier and
+published later, and they kept their place in line. Many arrive in batches
+just after the 9:30 open. To check this was the whole story rather than a
+convenient label, every execution in the day was tested against it. In
+150,003 executions the executed order was the lowest reference at its price
+every time, with no exceptions. The engine ranks orders by when they reach
+it, which is the right rule for a matching engine, so it was not changed.
+The replay counts a disagreement as explained only when it fits this
+pattern exactly, and fails on anything else.
+
+Executions in the opening and closing auctions, trades against hidden
+orders, and trading halts are applied or counted but are not continuous
+matching, so they are not part of the priority check.
+
+To reproduce, stream NASDAQ's file through the extractor. The 3.5 GB day
+file is never stored; the extract for these symbols is about 70 MB. Then
+replay it:
+
+```
+curl -s 'https://emi.nasdaq.com/ITCH/Nasdaq%20ITCH/12302019.NASDAQ_ITCH50.gz' |
+  go run ./cmd/itchextract -symbols AAPL,AMZN,INTC,MSFT,QQQ -o data/itch-20191230.itch.gz
+go run ./cmd/itchreplay data/itch-20191230.itch.gz
+```
+
+The extractor prints the input's SHA-256. The file used above was
+3,524,013,057 bytes with SHA-256
+`ef03df46a27e6bda4dead017f84c2e3979df7211f02c7868b51d53fceb99c689`. With the
+extract in place, `go test ./internal/replay` also runs the whole day as a
+test and requires zero unexplained results and identical digests across two
+replays. That takes about 15 seconds, or about 6 minutes under `-race`;
+`-short` skips it. The data is not committed, because NASDAQ's terms do not clearly
+allow redistribution.
+
 ## Testing
 
 - **Property-based suite**: 300 random scenarios × 400 operations, each
@@ -177,7 +249,12 @@ go run golang.org/x/perf/cmd/benchstat@v0.0.0-20261009192801-be2c69fb417e old.tx
 - Table-driven unit tests for FIFO priority, price priority, partial fills,
   price improvement, IOC semantics, cancels, duplicate-ID rejection, input
   validation, and cancels that would once have leaked queue slots.
-- `go test -race -cover ./...` gives **99.4% statement coverage**, race-clean.
+- **Real exchange data**: a full NASDAQ trading day replays with the book
+  matching after every message (see above). The ITCH parser is tested
+  against a message written byte by byte from the specification, and the
+  replay's checks are tested against a deliberately tampered engine.
+- `go test -race -cover ./...` gives **99.5% statement coverage** on the
+  engine, race-clean.
 
 ## Usage
 
