@@ -17,5 +17,36 @@ jobs:
         run: go vet ./...
       - name: test
         run: go test -race -cover ./...
+      - name: fuzz smoke
+        run: go test -run='^$' -fuzz=FuzzEngineVsReference -fuzztime=20s .
       - name: bench smoke
         run: go run ./cmd/bench -n 200000
+
+  # On pull requests, benchmark the base and the head on the same runner and
+  # post a benchstat comparison to the job summary. Shared runners are noisy,
+  # so this informs review rather than gating the merge; look for changes in
+  # allocs/op, which are exact, and large ns/op shifts.
+  bench-compare:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+      - name: bench head
+        run: go test -run='^$' -bench=. -benchmem -count=8 . | tee /tmp/new.txt
+      - name: bench base
+        run: |
+          git worktree add /tmp/base ${{ github.event.pull_request.base.sha }}
+          cd /tmp/base && go test -run='^$' -bench=. -benchmem -count=8 . | tee /tmp/old.txt
+      - name: benchstat
+        run: |
+          {
+            echo '## Benchmarks: base vs head'
+            echo '```'
+            go run golang.org/x/perf/cmd/benchstat@v0.0.0-20261009192801-be2c69fb417e /tmp/old.txt /tmp/new.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
