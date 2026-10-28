@@ -314,6 +314,22 @@ func (e *Engine) Replace(id, price, qty int64) Result {
 func (e *Engine) BestBid() (int64, int64, bool) { return topOf(e.bids) }
 func (e *Engine) BestAsk() (int64, int64, bool) { return topOf(e.asks) }
 
+// BestOrder reports the order at the front of one side: the oldest order
+// at the best price, which is the order the next crossing order from the
+// other side will trade with first.
+func (e *Engine) BestOrder(side Side) (id, price, qty int64, ok bool) {
+	sb := e.bids
+	if side == Sell {
+		sb = e.asks
+	}
+	lv := sb.best()
+	if lv == nil {
+		return 0, 0, 0, false
+	}
+	r := lv.front()
+	return r.id, r.price, r.qty, true
+}
+
 func topOf(sb *sideBook) (int64, int64, bool) {
 	lv := sb.best()
 	if lv == nil {

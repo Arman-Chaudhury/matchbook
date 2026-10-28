@@ -215,6 +215,31 @@ func TestLevelCompaction(t *testing.T) {
 	}
 }
 
+func TestBestOrder(t *testing.T) {
+	e := NewEngine()
+	if _, _, _, ok := e.BestOrder(Buy); ok {
+		t.Fatal("empty book has no best order")
+	}
+	e.Process(limit(1, Sell, 101, 5))
+	e.Process(limit(2, Sell, 100, 3)) // better price, later
+	e.Process(limit(3, Sell, 100, 4)) // same price, behind 2
+	e.Process(limit(4, Buy, 99, 6))
+	if id, p, q, ok := e.BestOrder(Sell); !ok || id != 2 || p != 100 || q != 3 {
+		t.Fatalf("best ask order %d %d/%d %v, want 2 at 100/3", id, p, q, ok)
+	}
+	if id, _, _, _ := e.BestOrder(Buy); id != 4 {
+		t.Fatalf("best bid order %d, want 4", id)
+	}
+	e.Cancel(2)
+	if id, _, _, _ := e.BestOrder(Sell); id != 3 {
+		t.Fatalf("after cancel, best ask order %d, want 3", id)
+	}
+	// It must agree with what matching actually does.
+	if tr := e.Process(market(5, Buy, 1)).Trades; tr[0].MakerID != 3 {
+		t.Fatalf("matching took %d, BestOrder said 3", tr[0].MakerID)
+	}
+}
+
 func TestDepthAggregation(t *testing.T) {
 	e := NewEngine()
 	e.Process(limit(1, Buy, 100, 5))
