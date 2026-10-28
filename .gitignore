@@ -1,3 +1,5 @@
 bench.json
 *.out
 *.prof
+# NASDAQ ITCH extracts: large, and not ours to redistribute
+data/
