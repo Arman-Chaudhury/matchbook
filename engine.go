@@ -10,12 +10,12 @@ type Engine struct {
 	byID    map[int64]*resting
 	seq     uint64
 	stp     STPMode
-	trade   []Trade // reused buffer to keep the hot path allocation-free
-	events  []Event // reused buffer: events emitted by the last command
-	evSeq   uint64  // sequence number of the last event emitted
-	digest  uint64  // running hash over every event ever emitted
+	trade   []Trade  // reused buffer to keep the hot path allocation-free
+	events  []Event  // reused buffer: events emitted by the last command
+	evSeq   uint64   // sequence number of the last event emitted
+	digest  uint64   // running hash over every event ever emitted
 	scratch []*level // reused heap copy for read-only walks (FOK, Depth)
-	pool    *pool   // recycled resting orders and levels, shared by both sides
+	pool    *pool    // recycled resting orders and levels, shared by both sides
 }
 
 // Option configures an Engine at construction.
