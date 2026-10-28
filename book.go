@@ -10,6 +10,7 @@ type resting struct {
 	qty       int64
 	seq       uint64 // arrival sequence: FIFO within a price level
 	cancelled bool
+	lv        *level // the level this order sits in, so cancel needs no lookup
 }
 
 // pool recycles resting orders and price levels so that steady-state
@@ -155,49 +156,51 @@ func (l *level) compact() {
 
 func (l *level) empty() bool { return l.front() == nil }
 
-// priceHeap is a binary heap of prices: bids descending, asks ascending.
-// It is hand-rolled rather than built on container/heap because that
-// package moves values through interface{}, which allocates for every
-// price above 255.
-type priceHeap struct {
-	prices []int64
-	desc   bool
+// levelHeap is a binary heap of levels ordered by price: bids descending,
+// asks ascending. It holds level pointers rather than prices, so reaching
+// the best level is a slice read with no map lookup. It is hand-rolled
+// rather than built on container/heap, which moves values through
+// interface{}.
+type levelHeap struct {
+	lvls []*level
+	desc bool
 }
 
-func (h *priceHeap) Len() int { return len(h.prices) }
+func (h *levelHeap) Len() int { return len(h.lvls) }
 
-func (h *priceHeap) less(i, j int) bool {
+func (h *levelHeap) less(i, j int) bool {
 	if h.desc {
-		return h.prices[i] > h.prices[j]
+		return h.lvls[i].price > h.lvls[j].price
 	}
-	return h.prices[i] < h.prices[j]
+	return h.lvls[i].price < h.lvls[j].price
 }
 
-func (h *priceHeap) push(p int64) {
-	h.prices = append(h.prices, p)
-	i := len(h.prices) - 1
+func (h *levelHeap) push(lv *level) {
+	h.lvls = append(h.lvls, lv)
+	i := len(h.lvls) - 1
 	for i > 0 {
 		parent := (i - 1) / 2
 		if !h.less(i, parent) {
 			break
 		}
-		h.prices[i], h.prices[parent] = h.prices[parent], h.prices[i]
+		h.lvls[i], h.lvls[parent] = h.lvls[parent], h.lvls[i]
 		i = parent
 	}
 }
 
 // pop removes the root.
-func (h *priceHeap) pop() {
-	n := len(h.prices) - 1
-	h.prices[0] = h.prices[n]
-	h.prices = h.prices[:n]
+func (h *levelHeap) pop() {
+	n := len(h.lvls) - 1
+	h.lvls[0] = h.lvls[n]
+	h.lvls[n] = nil
+	h.lvls = h.lvls[:n]
 	if n > 1 {
 		h.siftDown(0)
 	}
 }
 
-func (h *priceHeap) siftDown(i int) {
-	n := len(h.prices)
+func (h *levelHeap) siftDown(i int) {
+	n := len(h.lvls)
 	for {
 		l, r := 2*i+1, 2*i+2
 		best := i
@@ -210,23 +213,23 @@ func (h *priceHeap) siftDown(i int) {
 		if best == i {
 			return
 		}
-		h.prices[i], h.prices[best] = h.prices[best], h.prices[i]
+		h.lvls[i], h.lvls[best] = h.lvls[best], h.lvls[i]
 		i = best
 	}
 }
 
-// sideBook is one side of the order book: price levels keyed by price,
-// with a heap giving best-price access. Each price appears in the heap
-// exactly once while its level exists. Emptied levels are pruned lazily
-// when they reach the top.
+// sideBook is one side of the order book. The map finds a level by price
+// when an order rests; the heap gives the best level directly. Each level
+// is in both exactly once while it exists. Emptied levels are pruned
+// lazily when they reach the top of the heap.
 type sideBook struct {
 	levels map[int64]*level
-	heap   priceHeap
+	heap   levelHeap
 	pool   *pool
 }
 
 func newSideBook(desc bool, p *pool) *sideBook {
-	return &sideBook{levels: make(map[int64]*level), heap: priceHeap{desc: desc}, pool: p}
+	return &sideBook{levels: make(map[int64]*level), heap: levelHeap{desc: desc}, pool: p}
 }
 
 func (sb *sideBook) add(r *resting) {
@@ -234,21 +237,21 @@ func (sb *sideBook) add(r *resting) {
 	if !ok {
 		lv = sb.pool.getLevel(r.price)
 		sb.levels[r.price] = lv
-		sb.heap.push(r.price)
+		sb.heap.push(lv)
 	}
+	r.lv = lv
 	lv.push(r)
 }
 
 // best returns the best-priced non-empty level, pruning dead levels.
 func (sb *sideBook) best() *level {
 	for sb.heap.Len() > 0 {
-		price := sb.heap.prices[0]
-		lv := sb.levels[price]
+		lv := sb.heap.lvls[0]
 		if !lv.empty() {
 			return lv
 		}
 		sb.heap.pop()
-		delete(sb.levels, price)
+		delete(sb.levels, lv.price)
 		sb.pool.putLevel(lv)
 	}
 	return nil

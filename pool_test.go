@@ -34,10 +34,10 @@ func checkPool(t *testing.T, e *Engine) {
 		if len(sb.levels) != sb.heap.Len() {
 			t.Fatalf("%d levels but %d heap entries", len(sb.levels), sb.heap.Len())
 		}
-		for _, p := range sb.heap.prices {
-			lv, ok := sb.levels[p]
-			if !ok {
-				t.Fatalf("heap price %d has no level", p)
+		for _, lv := range sb.heap.lvls {
+			p := lv.price
+			if sb.levels[p] != lv {
+				t.Fatalf("heap level %d is not the map's level for that price", p)
 			}
 			if pooledLevels[lv] {
 				t.Fatalf("live level %d is also in the pool", p)
@@ -49,6 +49,9 @@ func checkPool(t *testing.T, e *Engine) {
 				}
 				if r.cancelled {
 					dead++
+				}
+				if r.lv != lv {
+					t.Fatalf("order %d in level %d points at a different level", r.id, p)
 				}
 			}
 			if dead != lv.dead {

@@ -14,7 +14,7 @@ type Engine struct {
 	events  []Event // reused buffer: events emitted by the last command
 	evSeq   uint64  // sequence number of the last event emitted
 	digest  uint64  // running hash over every event ever emitted
-	scratch []int64 // reused heap copy for read-only walks (FOK, Depth)
+	scratch []*level // reused heap copy for read-only walks (FOK, Depth)
 	pool    *pool   // recycled resting orders and levels, shared by both sides
 }
 
@@ -220,18 +220,14 @@ func (e *Engine) remove(r *resting, lv *level) {
 // stops counting once o.Qty is reached. Used only for fill-or-kill, so its
 // heap copy is off the common hot path.
 func (e *Engine) available(o Order, opposite *sideBook) int64 {
-	e.scratch = append(e.scratch[:0], opposite.heap.prices...)
-	tmp := priceHeap{prices: e.scratch, desc: opposite.heap.desc}
+	e.scratch = append(e.scratch[:0], opposite.heap.lvls...)
+	tmp := levelHeap{lvls: e.scratch, desc: opposite.heap.desc}
 	var sum int64
 	for tmp.Len() > 0 && sum < o.Qty {
-		price := tmp.prices[0]
+		lv := tmp.lvls[0]
 		tmp.pop()
-		if !crosses(o.Side, o.Type, o.Price, price) {
+		if !crosses(o.Side, o.Type, o.Price, lv.price) {
 			break
-		}
-		lv, ok := opposite.levels[price]
-		if !ok {
-			continue
 		}
 		for i := lv.head; i < len(lv.orders) && sum < o.Qty; i++ {
 			m := lv.orders[i]
@@ -283,11 +279,7 @@ func (e *Engine) cancel(r *resting) {
 	r.cancelled = true
 	delete(e.byID, r.id)
 	// Adjust the level's live quantity so depth snapshots stay accurate.
-	sb := e.bids
-	if r.side == Sell {
-		sb = e.asks
-	}
-	lv := sb.levels[r.price]
+	lv := r.lv
 	lv.qty -= r.qty
 	r.qty = 0
 	lv.tombstone() // may sweep and recycle r; callers must not use r after this
@@ -314,11 +306,7 @@ func (e *Engine) Replace(id, price, qty int64) Result {
 		return e.reject(id, RejectPrice)
 	}
 	if price == r.price && qty <= r.qty {
-		sb := e.bids
-		if r.side == Sell {
-			sb = e.asks
-		}
-		sb.levels[r.price].qty -= r.qty - qty
+		r.lv.qty -= r.qty - qty
 		r.qty = qty
 		e.emit(Event{Kind: EvReduced, OrderID: id, Side: r.side, Price: price, Qty: qty})
 		return Result{Status: Rested, Trades: e.trade, Remaining: qty}
@@ -350,13 +338,13 @@ func (e *Engine) Depth(side Side, n int) []Depth {
 		sb = e.asks
 	}
 	out := make([]Depth, 0, n)
-	e.scratch = append(e.scratch[:0], sb.heap.prices...)
-	tmp := priceHeap{prices: e.scratch, desc: sb.heap.desc}
+	e.scratch = append(e.scratch[:0], sb.heap.lvls...)
+	tmp := levelHeap{lvls: e.scratch, desc: sb.heap.desc}
 	for len(out) < n && tmp.Len() > 0 {
-		price := tmp.prices[0]
+		lv := tmp.lvls[0]
 		tmp.pop()
-		if lv := sb.levels[price]; !lv.empty() {
-			out = append(out, Depth{Price: price, Qty: lv.qty})
+		if !lv.empty() {
+			out = append(out, Depth{Price: lv.price, Qty: lv.qty})
 		}
 	}
 	return out
