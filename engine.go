@@ -14,7 +14,8 @@ type Engine struct {
 	events  []Event // reused buffer: events emitted by the last command
 	evSeq   uint64  // sequence number of the last event emitted
 	digest  uint64  // running hash over every event ever emitted
-	scratch []int64 // reused heap copy for read-only walks (FOK check)
+	scratch []int64 // reused heap copy for read-only walks (FOK, Depth)
+	pool    *pool   // recycled resting orders and levels, shared by both sides
 }
 
 // Option configures an Engine at construction.
@@ -27,11 +28,13 @@ func WithSelfTradePrevention(m STPMode) Option {
 }
 
 func NewEngine(opts ...Option) *Engine {
+	p := &pool{}
 	e := &Engine{
-		bids:   newSideBook(true),
-		asks:   newSideBook(false),
+		bids:   newSideBook(true, p),
+		asks:   newSideBook(false, p),
 		byID:   make(map[int64]*resting),
 		digest: fnv64Offset,
+		pool:   p,
 	}
 	for _, o := range opts {
 		o(e)
@@ -164,7 +167,7 @@ func (e *Engine) process(o Order) Result {
 		lv.qty -= qty
 		if maker.qty == 0 {
 			delete(e.byID, maker.id)
-			lv.head++
+			lv.pop()
 		}
 	}
 
@@ -193,7 +196,8 @@ func (e *Engine) reject(id int64, r Reject) Result {
 // rest places the remainder of o on its side of the book.
 func (e *Engine) rest(o Order) {
 	e.seq++
-	r := &resting{id: o.ID, side: o.Side, owner: o.Owner, price: o.Price, qty: o.Qty, seq: e.seq}
+	r := e.pool.getOrder()
+	*r = resting{id: o.ID, side: o.Side, owner: o.Owner, price: o.Price, qty: o.Qty, seq: e.seq}
 	e.byID[o.ID] = r
 	if o.Side == Buy {
 		e.bids.add(r)
@@ -208,7 +212,7 @@ func (e *Engine) remove(r *resting, lv *level) {
 	delete(e.byID, r.id)
 	lv.qty -= r.qty
 	r.qty = 0
-	lv.head++
+	lv.pop()
 }
 
 // available returns how much of o could trade right now, applying the same
@@ -221,7 +225,7 @@ func (e *Engine) available(o Order, opposite *sideBook) int64 {
 	var sum int64
 	for tmp.Len() > 0 && sum < o.Qty {
 		price := tmp.prices[0]
-		(&tmp).Pop2()
+		tmp.pop()
 		if !crosses(o.Side, o.Type, o.Price, price) {
 			break
 		}
@@ -335,57 +339,25 @@ func topOf(sb *sideBook) (int64, int64, bool) {
 	return lv.price, lv.qty, true
 }
 
-// Depth returns up to n aggregated levels for one side, best first.
+// Depth returns up to n aggregated levels for one side, best first. It
+// walks a copy of the price heap, so the live heap is untouched; each price
+// appears in the heap exactly once, so no de-duplication is needed.
 func (e *Engine) Depth(side Side, n int) []Depth {
 	sb := e.bids
 	if side == Sell {
 		sb = e.asks
 	}
 	out := make([]Depth, 0, n)
-	seen := make(map[int64]bool)
-	// Walk a copy of the heap so we don't disturb ordering.
-	tmp := priceHeap{prices: append([]int64(nil), sb.heap.prices...), desc: sb.heap.desc}
+	e.scratch = append(e.scratch[:0], sb.heap.prices...)
+	tmp := priceHeap{prices: e.scratch, desc: sb.heap.desc}
 	for len(out) < n && tmp.Len() > 0 {
 		price := tmp.prices[0]
-		(&tmp).Pop2()
-		if seen[price] {
-			continue
-		}
-		seen[price] = true
-		if lv, ok := sb.levels[price]; ok && !lv.empty() {
+		tmp.pop()
+		if lv := sb.levels[price]; !lv.empty() {
 			out = append(out, Depth{Price: price, Qty: lv.qty})
 		}
 	}
 	return out
-}
-
-// Pop2 pops the heap root (small helper avoiding interface boxing in Depth).
-func (h *priceHeap) Pop2() {
-	n := h.Len()
-	h.Swap(0, n-1)
-	h.prices = h.prices[:n-1]
-	if n > 1 {
-		siftDown(h, 0)
-	}
-}
-
-func siftDown(h *priceHeap, i int) {
-	n := h.Len()
-	for {
-		l, r := 2*i+1, 2*i+2
-		smallest := i
-		if l < n && h.Less(l, smallest) {
-			smallest = l
-		}
-		if r < n && h.Less(r, smallest) {
-			smallest = r
-		}
-		if smallest == i {
-			return
-		}
-		h.Swap(i, smallest)
-		i = smallest
-	}
 }
 
 func min(a, b int64) int64 {
