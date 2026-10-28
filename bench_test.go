@@ -1,8 +1,12 @@
-package matchbook
+package matchbook_test
 
 import (
 	"math/rand"
+	"sync"
 	"testing"
+
+	"github.com/Arman-Chaudhury/matchbook"
+	"github.com/Arman-Chaudhury/matchbook/internal/flow"
 )
 
 // Benchmarks report time and allocations per operation. Compare two
@@ -13,109 +17,131 @@ import (
 //	go test -run=^$ -bench=. -benchmem -count=10 > new.txt
 //	benchstat old.txt new.txt
 //
-// Order streams are generated once, outside the timer. IDs are offset on
-// each pass so a long run never resubmits a resting ID.
+// Streams are generated once, outside the timer.
 
-const benchFlow = 1 << 16
+const streamLen = 1 << 20
 
-// mixedFlow mirrors cmd/bench: 90% limit, 10% market, a 40-tick band, so
-// most orders cross and the book stays a realistic size.
-func mixedFlow(seed int64) []Order {
-	rng := rand.New(rand.NewSource(seed))
-	orders := make([]Order, benchFlow)
-	for i := range orders {
-		o := Order{Side: Side(rng.Intn(2)), Type: Limit, Qty: int64(1 + rng.Intn(100))}
-		if rng.Intn(10) == 0 {
-			o.Type = Market
-		} else {
-			o.Price = int64(1000 + rng.Intn(40))
+// Streams are built on first use, not in init, so ordinary test runs do
+// not pay for generating them.
+var (
+	stationary = sync.OnceValue(func() []matchbook.Command {
+		cmds, _ := flow.Stationary(flow.DefaultConfig(), streamLen)
+		return cmds
+	})
+	stationarySTP = sync.OnceValue(func() []matchbook.Command {
+		cfg := flow.DefaultConfig()
+		cfg.Owners, cfg.STP = 8, matchbook.STPCancelMaker
+		cmds, _ := flow.Stationary(cfg, streamLen)
+		return cmds
+	})
+)
+
+// replay applies a pre-generated command stream b.N times in total. The
+// stream assumes the book state it was generated against, so at the end of
+// each pass a fresh engine is swapped in with the timer stopped.
+func replay(b *testing.B, cmds []matchbook.Command, opts ...matchbook.Option) {
+	e := matchbook.NewEngine(opts...)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		j := i % len(cmds)
+		if j == 0 && i > 0 {
+			b.StopTimer()
+			e = matchbook.NewEngine(opts...)
+			b.StartTimer()
 		}
-		orders[i] = o
+		e.Apply(cmds[j])
 	}
-	return orders
 }
 
-func runFlow(b *testing.B, e *Engine, flow []Order) {
+// BenchmarkStationary is the headline number. A book of about 1,500 resting
+// orders around a drifting mid; one third of commands are cancels of live
+// orders, the rest are mostly passive quotes near the touch, with some
+// aggressive limits and a few market orders. See internal/flow.
+func BenchmarkStationary(b *testing.B) {
+	replay(b, stationary())
+}
+
+// BenchmarkStationarySTP is the same shape with eight owners and
+// cancel-maker self-trade prevention, to show what the check costs.
+func BenchmarkStationarySTP(b *testing.B) {
+	replay(b, stationarySTP(), matchbook.WithSelfTradePrevention(matchbook.STPCancelMaker))
+}
+
+// BenchmarkGrowingBook is the original benchmark flow: uniform prices over
+// 40 ticks, 10% market orders and no cancels. About one order in eight rests
+// forever, so the book grows without bound for the whole run. It is a
+// stress test of allocation and GC under an unbounded book, not a model of
+// a real market.
+func BenchmarkGrowingBook(b *testing.B) {
+	orders := flow.Growing(42, streamLen)
+	e := matchbook.NewEngine()
 	b.ReportAllocs()
 	b.ResetTimer()
 	var base int64
 	for i := 0; i < b.N; i++ {
-		j := i % len(flow)
+		j := i % len(orders)
 		if j == 0 && i > 0 {
-			base += int64(len(flow))
+			base += int64(len(orders))
 		}
-		o := flow[j]
-		o.ID = base + int64(j) + 1
+		o := orders[j]
+		o.ID += base
 		e.Process(o)
 	}
 }
 
-// BenchmarkProcessMixed is the headline number: a crossing flow where most
-// orders trade and some rest.
-func BenchmarkProcessMixed(b *testing.B) {
-	runFlow(b, NewEngine(), mixedFlow(42))
-}
-
-// BenchmarkProcessMixedSTP is the same flow with owners and self-trade
-// prevention on, to show what the check costs.
-func BenchmarkProcessMixedSTP(b *testing.B) {
-	flow := mixedFlow(42)
-	for i := range flow {
-		flow[i].Owner = int64(1 + i%8)
-	}
-	runFlow(b, NewEngine(WithSelfTradePrevention(STPCancelMaker)), flow)
-}
-
-// BenchmarkRestNoCross only adds liquidity: bids below 1000, asks above,
-// spread across 200 levels per side. This isolates the cost of resting.
+// BenchmarkRestNoCross only adds liquidity, spread across 200 levels per
+// side, isolating the cost of resting. The book is reset every pass.
 func BenchmarkRestNoCross(b *testing.B) {
 	rng := rand.New(rand.NewSource(7))
-	flow := make([]Order, benchFlow)
-	for i := range flow {
-		o := Order{Side: Side(rng.Intn(2)), Type: Limit, Qty: int64(1 + rng.Intn(100))}
-		if o.Side == Buy {
+	orders := make([]matchbook.Order, streamLen)
+	for i := range orders {
+		o := matchbook.Order{ID: int64(i + 1), Side: matchbook.Side(rng.Intn(2)), Type: matchbook.Limit, Qty: int64(1 + rng.Intn(100))}
+		if o.Side == matchbook.Buy {
 			o.Price = int64(800 + rng.Intn(200))
 		} else {
 			o.Price = int64(1001 + rng.Intn(200))
 		}
-		flow[i] = o
+		orders[i] = o
 	}
-	// A fresh engine per pass keeps the book from growing without bound.
+	e := matchbook.NewEngine()
 	b.ReportAllocs()
 	b.ResetTimer()
-	e := NewEngine()
 	for i := 0; i < b.N; i++ {
-		j := i % len(flow)
+		j := i % len(orders)
 		if j == 0 && i > 0 {
 			b.StopTimer()
-			e = NewEngine()
+			e = matchbook.NewEngine()
 			b.StartTimer()
 		}
-		o := flow[j]
-		o.ID = int64(j) + 1
-		e.Process(o)
+		e.Process(orders[j])
 	}
 }
 
 // BenchmarkRestThenCancel measures a rest followed by its cancel, the
-// typical market-maker quote churn.
+// typical market-maker quote churn. One op is the pair.
 func BenchmarkRestThenCancel(b *testing.B) {
-	e := NewEngine()
+	e := matchbook.NewEngine()
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		id := int64(i) + 1
-		e.Process(Order{ID: id, Side: Side(i & 1), Type: Limit, Price: 1000 + int64(i%20) - int64(i&1)*40, Qty: 10})
+		side := matchbook.Side(i & 1)
+		price := int64(1000 + i%20)
+		if side == matchbook.Sell {
+			price += 40
+		}
+		e.Process(matchbook.Order{ID: id, Side: side, Type: matchbook.Limit, Price: price, Qty: 10})
 		e.Cancel(id)
 	}
 }
 
 // BenchmarkReplaceReduce shrinks resting orders in place.
 func BenchmarkReplaceReduce(b *testing.B) {
-	e := NewEngine()
+	e := matchbook.NewEngine()
 	const n = 1024
 	for i := int64(1); i <= n; i++ {
-		e.Process(Order{ID: i, Side: Buy, Type: Limit, Price: 900 + i%50, Qty: 1 << 40})
+		e.Process(matchbook.Order{ID: i, Side: matchbook.Buy, Type: matchbook.Limit, Price: 900 + i%50, Qty: 1 << 40})
 	}
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -128,10 +154,10 @@ func BenchmarkReplaceReduce(b *testing.B) {
 // BenchmarkReplaceMove moves resting orders to a new price, which loses
 // priority and re-enters them.
 func BenchmarkReplaceMove(b *testing.B) {
-	e := NewEngine()
+	e := matchbook.NewEngine()
 	const n = 1024
 	for i := int64(1); i <= n; i++ {
-		e.Process(Order{ID: i, Side: Buy, Type: Limit, Price: 900 + i%50, Qty: 10})
+		e.Process(matchbook.Order{ID: i, Side: matchbook.Buy, Type: matchbook.Limit, Price: 900 + i%50, Qty: 10})
 	}
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -143,13 +169,13 @@ func BenchmarkReplaceMove(b *testing.B) {
 
 // BenchmarkDepth10 takes a 10-level snapshot of a populated side.
 func BenchmarkDepth10(b *testing.B) {
-	e := NewEngine()
+	e := matchbook.NewEngine()
 	for i := int64(1); i <= 2000; i++ {
-		e.Process(Order{ID: i, Side: Buy, Type: Limit, Price: 800 + i%200, Qty: 5})
+		e.Process(matchbook.Order{ID: i, Side: matchbook.Buy, Type: matchbook.Limit, Price: 800 + i%200, Qty: 5})
 	}
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		e.Depth(Buy, 10)
+		e.Depth(matchbook.Buy, 10)
 	}
 }
